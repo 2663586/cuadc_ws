@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.so
+.env
+venv/
+.venv/
+logs/
+*.log
+*.pt
+*.onnx
+*.engine
+.DS_Store
+*.swp
+*.swo
+*~
