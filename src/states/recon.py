@@ -1,9 +1,9 @@
 """
-Recon state — serpentine scan over the recon zone.
+侦察状态 —— 在侦察区域上方进行蛇形扫描。
 
-Flies a pre-computed rectangular scan pattern covering the 8×5 m recon area
-at low altitude so the FPV video feed captures hazard-identification markers.
-No onboard classification — the ground station crew reads the video feed.
+在低空沿预计算的矩形扫描路径覆盖 8×5 米的侦察区域，
+使 FPV 视频流能够捕捉危险识别标记。
+不进行机载分类 —— 地面站人员观看视频流进行判读。
 """
 
 from .base_state import BaseState
@@ -11,7 +11,7 @@ from config import RECON_ZONE_DISTANCE_M, RECON_ALTITUDE_M, RECON_SCAN_STEP_M
 
 
 class ReconState(BaseState):
-    """Serpentine scan over the recon zone for video-based identification."""
+    """在侦察区域上方进行蛇形扫描以进行视频识别。"""
 
     def __init__(self, timeout_s: float = 120):
         super().__init__("Recon", timeout_s)
@@ -21,9 +21,9 @@ class ReconState(BaseState):
     async def enter(self, interface):
         await super().enter(interface)
 
-        cx = RECON_ZONE_DISTANCE_M  # recon zone centre distance
-        cy = 0.0                    # centre line
-        half_w, half_h = 4.0, 2.5   # half-width, half-height of 8×5 m zone
+        cx = RECON_ZONE_DISTANCE_M  # 侦察区域中心距离
+        cy = 0.0                    # 中心线
+        half_w, half_h = 4.0, 2.5   # 8×5 米区域的半宽和半高
         step = RECON_SCAN_STEP_M
 
         self._waypoints = [
@@ -37,28 +37,28 @@ class ReconState(BaseState):
         ]
         self._current_wp = 0
 
-        # Send first waypoint
+        # 发送第一个航点
         wp = self._waypoints[0]
         sp = interface.field_to_ned(*wp)
         interface.update_setpoint(sp)
 
-        print(f"[Recon] Starting serpentine scan, "
-              f"{len(self._waypoints)} waypoints")
+        print(f"[侦察] 开始蛇形扫描，"
+              f"共 {len(self._waypoints)} 个航点")
 
     async def execute(self, interface):
         if self.is_timed_out():
-            self.error = "recon timeout — partial scan usable"
+            self.error = "侦察超时 —— 部分扫描结果仍可使用"
             return True, None
 
         if self._current_wp >= len(self._waypoints):
-            print("[Recon] Scan complete")
+            print("[侦察] 扫描完成")
             self.is_completed = True
             return True, None
 
         wp_x, wp_y, wp_z = self._waypoints[self._current_wp]
         alt = await interface.get_altitude()
 
-        # Estimate time per waypoint (~ 2-3 m spacing at ~3 m/s)
+        # 估算每个航点的时间（约 2-3 米间距，约 3 米/秒）
         dist_per_wp = 2.5
         est_time = dist_per_wp / 3.0
 
@@ -69,6 +69,6 @@ class ReconState(BaseState):
                 nx, ny, nz = self._waypoints[self._current_wp]
                 sp = interface.field_to_ned(nx, ny, nz)
                 interface.update_setpoint(sp)
-                print(f"[Recon] Waypoint {self._current_wp}/{len(self._waypoints)}")
+                print(f"[侦察] 航点 {self._current_wp}/{len(self._waypoints)}")
 
         return False, None

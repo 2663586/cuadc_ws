@@ -1,8 +1,8 @@
 """
-Mission finite-state-machine engine.
+任务有限状态机引擎。
 
-Manages the mission queue, cycles through states, performs
-global health checks every iteration, and handles errors / timeouts.
+管理任务队列，循环执行各状态，
+每次迭代执行全局健康检查，并处理错误/超时。
 """
 
 import asyncio
@@ -25,7 +25,7 @@ from states.land import PrecisionLandState
 
 
 class MissionFSM:
-    """Mission state-machine engine."""
+    """任务状态机引擎。"""
 
     def __init__(self, interface: PX4Interface):
         self.interface = interface
@@ -33,11 +33,11 @@ class MissionFSM:
         self.current_state: Optional[BaseState] = None
         self.state_index = 0
 
-        # Register the unhealthy callback
+        # 注册不健康回调
         interface._on_unhealthy = self._handle_unhealthy
 
     def build_mission(self):
-        """Build the mission sequence."""
+        """构建任务序列。"""
         from config import (
             CRUISE_ALTITUDE_M, DROP_ZONE_DISTANCE_M, RECON_ZONE_DISTANCE_M,
             LAND_START_ALTITUDE_M, TRANSIT_SPEED_MPS,
@@ -51,7 +51,7 @@ class MissionFSM:
                          speed=TRANSIT_SPEED_MPS, timeout_s=30),
             HoverState(hover_time=1.0),
 
-            # Drop phase: coarse detection once, then align + drop per bottle
+            # 投掷阶段：先进行一次粗略检测，然后对每个瓶子进行对准 + 投放
             SearchState(timeout_s=30),
             AlignState(bottle_index=1, timeout_s=60),
             DropState(bottle_index=1, timeout_s=10),
@@ -71,7 +71,7 @@ class MissionFSM:
         self.state_index = 0
 
     async def run(self):
-        """Main FSM loop."""
+        """主状态机循环。"""
         self.build_mission()
         await self.interface.connect_and_setup()
         await self.interface.arm_and_offboard()
@@ -80,18 +80,18 @@ class MissionFSM:
             state = self.mission_queue[self.state_index]
             self.current_state = state
 
-            # ---- Global health check ----
+            # ---- 全局健康检查 ----
             if not await self.interface.global_guard_check():
-                await self._handle_unhealthy("global_guard failed before state")
+                await self._handle_unhealthy("进入状态前全局守卫失败")
                 break
 
-            # ---- Enter state ----
+            # ---- 进入状态 ----
             await state.enter(self.interface)
 
-            # ---- Execute loop ----
+            # ---- 执行循环 ----
             while True:
                 if not await self.interface.global_guard_check():
-                    await self._handle_unhealthy("health check in state")
+                    await self._handle_unhealthy("状态执行中健康检查失败")
                     return
 
                 try:
@@ -105,30 +105,30 @@ class MissionFSM:
                     break
                 await asyncio.sleep(1.0 / FSM_LOOP_HZ)
 
-            # ---- Exit state ----
+            # ---- 退出状态 ----
             await state.exit(self.interface)
 
-            # ---- Timeout handling ----
+            # ---- 超时处理 ----
             if state.is_timed_out() and not state.is_completed:
-                print(f"[WARN] {state.name} timed out ({state.timeout_s}s), "
-                      f"skipping")
+                print(f"[警告] {state.name} 超时 ({state.timeout_s}秒)，"
+                      f"跳过")
 
             self.state_index += 1
 
-        # Mission complete
+        # 任务完成
         await self.interface.disarm()
-        print("[INFO] Mission complete")
+        print("[信息] 任务完成")
 
     async def _handle_unhealthy(self, reason: str):
-        """Emergency: force hover on health failure."""
-        print(f"[EMERGENCY] Global health check failed: {reason}")
+        """紧急情况：健康检查失败时强制悬停。"""
+        print(f"[紧急] 全局健康检查失败: {reason}")
         self.interface.update_setpoint(
             PositionNedYaw(0.0, 0.0, 0.0, 0.0)
         )
 
     async def _handle_state_error(self, state: BaseState, error: Exception):
-        """Unified error handling for state execution failures."""
-        print(f"[ERROR] {state.name} raised exception: {error}")
+        """状态执行错误的统一处理。"""
+        print(f"[错误] {state.name} 抛出异常: {error}")
         self.interface.update_setpoint(
             PositionNedYaw(0.0, 0.0, 0.0, 0.0)
         )

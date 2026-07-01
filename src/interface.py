@@ -1,12 +1,12 @@
 """
-PX4 communication layer — wraps all MAVSDK interactions.
+PX4 通信层 —— 封装所有 MAVSDK 交互。
 
-Provides:
-- Health watchdog (global guard) for fail-safe
-- Offboard heartbeat loop (independent asyncio task, 20 Hz)
-- Telemetry monitoring (health, battery, connection state)
-- Field-to-NED coordinate conversion
-- High-level commands (takeoff, land, set_actuator)
+提供：
+- 健康看门狗（全局守卫）用于故障安全
+- Offboard 心跳循环（独立 asyncio 任务，20 Hz）
+- 遥测监控（健康状态、电量、连接状态）
+- 场地坐标到 NED 坐标的转换
+- 高级指令（起飞、降落、舵机控制）
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from mavsdk.offboard import PositionNedYaw
 
 @dataclass
 class HealthStatus:
-    """Snapshot of flight-controller health."""
+    """飞控健康状态快照。"""
 
     is_connected: bool = False
     is_armed: bool = False
@@ -29,7 +29,7 @@ class HealthStatus:
     is_home_position_ok: bool = False
     battery_pct: float = 100.0
     estimator_flags_ok: bool = True
-    gps_fix_type: int = 3  # SITL always has 3D fix; updated by _gps_watcher
+    gps_fix_type: int = 3  # SITL 始终有 3D 定位；由 _gps_watcher 更新
     altitude_m: float = 0.0
 
     @property
@@ -48,7 +48,7 @@ class HealthStatus:
 
 
 class PX4Interface:
-    """Encapsulates all MAVSDK interactions with built-in safety mechanisms."""
+    """封装所有 MAVSDK 交互，内置安全机制。"""
 
     def __init__(self, system_address: str = "udp://0.0.0.0:14540",
                  on_unhealthy: Optional[Callable] = None):
@@ -57,58 +57,58 @@ class PX4Interface:
         self.health = HealthStatus()
         self._on_unhealthy = on_unhealthy
 
-        # Heartbeat state
+        # 心跳状态
         self._last_setpoint = PositionNedYaw(0.0, 0.0, 0.0, 0.0)
 
-        # Field yaw — auto-detected at arm time
+        # 场地航向 —— 上锁时自动检测
         self.FIELD_YAW_DEG: float = 0.0
 
-        # Shared storage for cross-state data (e.g. search results)
+        # 跨状态共享数据存储（例如搜索结果）
         self.shared: dict = {}
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # 生命周期
     # ------------------------------------------------------------------
 
     async def connect_and_setup(self):
-        """Connect to PX4, wait for GPS lock, detect field orientation."""
+        """连接到 PX4，等待 GPS 锁定，检测场地朝向。"""
         await self.drone.connect(system_address=self.system_address)
 
-        # Wait for connection
+        # 等待连接
         async for state in self.drone.core.connection_state():
             if state.is_connected:
                 break
         self.health.is_connected = True
 
-        # Wait for global position and home position
+        # 等待全局位置和家点位置
         async for health in self.drone.telemetry.health():
             if health.is_global_position_ok and health.is_home_position_ok:
                 break
         self.health.is_global_position_ok = True
         self.health.is_home_position_ok = True
 
-        # Auto-detect field orientation from current heading
+        # 从当前航向自动检测场地朝向
         async for heading in self.drone.telemetry.heading():
             self.FIELD_YAW_DEG = heading.heading_deg
-            print(f"[INFO] Field orientation auto-detected: "
-                  f"FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} deg")
+            print(f"[信息] 场地朝向自动检测: "
+                  f"FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度")
             break
 
-        # Start background tasks
+        # 启动后台任务
         asyncio.create_task(self._heartbeat_loop())
 
     async def arm_and_offboard(self):
-        """Arm the drone and switch to offboard mode."""
-        # Send a zero setpoint so offboard has something to latch onto
+        """上锁并切换到 offboard 模式。"""
+        # 发送零设定值以便 offboard 有东西可锁定
         await self.drone.offboard.set_position_ned(self._last_setpoint)
         await self.drone.action.arm()
         await self.drone.offboard.start()
         self.health.is_armed = True
         self.health.is_offboard = True
-        print("[INFO] Armed and offboard mode engaged")
+        print("[信息] 已上锁，offboard 模式已启用")
 
     async def disarm(self):
-        """Exit offboard mode and disarm."""
+        """退出 offboard 模式并断开上锁。"""
         try:
             await self.drone.offboard.stop()
         except Exception:
@@ -117,19 +117,19 @@ class PX4Interface:
             await self.drone.action.disarm()
         except Exception:
             pass
-        print("[INFO] Disarmed")
+        print("[信息] 已断开上锁")
 
     # ------------------------------------------------------------------
-    # Health watchdog
+    # 健康看门狗
     # ------------------------------------------------------------------
 
     async def global_guard_check(self) -> bool:
         """
-        Called every loop cycle. Returns True if healthy.
+        每个循环周期调用。返回 True 表示健康。
 
-        All telemetry is read via point-in-time queries, throttled to ~2 Hz
-        to avoid overwhelming MAVSDK's gRPC callback queue.
-        Between ticks, returns the last cached result.
+        所有遥测数据通过即时查询读取，节流至约 2 Hz
+        以避免压垮 MAVSDK 的 gRPC 回调队列。
+        两次读取之间返回上次缓存的结果。
         """
         import time as _time
 
@@ -139,7 +139,7 @@ class PX4Interface:
         if not hasattr(self, "_cached_healthy"):
             self._cached_healthy = True
 
-        # Throttle: do the actual MAVSDK reads only at ~2 Hz
+        # 节流：实际 MAVSDK 读取仅约 2 Hz
         if now - self._last_guard_read > 0.5:
             self._last_guard_read = now
             try:
@@ -163,22 +163,22 @@ class PX4Interface:
                     self.health.altitude_m = pos.relative_altitude_m
                     break
             except Exception as e:
-                print(f"[DEBUG] global_guard_check read error: {e}")
+                print(f"[调试] global_guard_check 读取错误: {e}")
             self._cached_healthy = self.health.is_healthy
 
         return self._cached_healthy
 
     # ------------------------------------------------------------------
-    # Offboard heartbeat (independent task — keeps PX4 from timing out)
+    # Offboard 心跳（独立任务 —— 防止 PX4 超时）
     # ------------------------------------------------------------------
 
     async def _heartbeat_loop(self):
         """
-        Send setpoint at fixed rate. If main logic hasn't updated the
-        setpoint, re-send the last one (lazy hold).
+        以固定频率发送设定值。如果主逻辑尚未更新设定值，
+        则重新发送上一次的值（惰性保持）。
 
-        PX4 requires >= 2 Hz; we send at OFFBOARD_HEARTBEAT_HZ (~20 Hz)
-        for margin.
+        PX4 要求 >= 2 Hz；我们以 OFFBOARD_HEARTBEAT_HZ（约 20 Hz）
+        发送以留出余量。
         """
         from config import OFFBOARD_HEARTBEAT_HZ
 
@@ -188,35 +188,35 @@ class PX4Interface:
             await asyncio.sleep(interval)
 
     def update_setpoint(self, setpoint: PositionNedYaw):
-        """Main logic calls this to issue a new setpoint."""
+        """主逻辑调用此方法以发布新的设定值。"""
         self._last_setpoint = setpoint
 
     # ------------------------------------------------------------------
-    # High-level commands
+    # 高级指令
     # ------------------------------------------------------------------
 
     async def takeoff(self, altitude_m: float):
-        """Command takeoff to specified altitude."""
+        """指令起飞到指定高度。"""
         await self.drone.action.set_takeoff_altitude(altitude_m)
         await self.drone.action.takeoff()
-        print(f"[CMD] Takeoff to {altitude_m:.1f} m")
+        print(f"[指令] 起飞至 {altitude_m:.1f} 米")
 
     async def set_actuator(self, index: int, value: float):
-        """Control an actuator (e.g. servo) via AUX output."""
+        """通过 AUX 输出控制舵机（例如投放舵机）。"""
         await self.drone.action.set_actuator(index, value)
-        print(f"[CMD] Actuator {index} -> {value:.2f}")
+        print(f"[指令] 舵机 {index} -> {value:.2f}")
 
     async def land(self):
-        """Command auto-land."""
+        """指令自动降落。"""
         await self.drone.action.land()
-        print("[CMD] Land")
+        print("[指令] 降落")
 
     # ------------------------------------------------------------------
-    # Telemetry queries (snapshot reads)
+    # 遥测查询（快照读取）
     # ------------------------------------------------------------------
 
     async def get_position_ned(self) -> PositionNedYaw:
-        """Get current NED position (single snapshot)."""
+        """获取当前 NED 位置（单次快照）。"""
         async for odom in self.drone.telemetry.odometry():
             return PositionNedYaw(
                 odom.position_body.x_m,
@@ -226,33 +226,33 @@ class PX4Interface:
             )
 
     async def get_altitude(self) -> float:
-        """Get current relative altitude (cached, updated at ~2 Hz)."""
+        """获取当前相对高度（缓存值，约 2 Hz 更新）。"""
         return self.health.altitude_m
 
     async def get_heading(self) -> float:
-        """Get current heading in degrees."""
+        """获取当前航向角度。"""
         async for heading in self.drone.telemetry.heading():
             return heading.heading_deg
 
     # ------------------------------------------------------------------
-    # Field-to-NED coordinate conversion
+    # 场地坐标到 NED 坐标的转换
     # ------------------------------------------------------------------
 
     def field_to_ned(self, forward_m: float, right_m: float,
                      height_m: float) -> PositionNedYaw:
         """
-        Convert field coordinates (forward / right / height) to NED + yaw.
+        将场地坐标（前 / 右 / 高）转换为 NED + 航向。
 
-        The N axis is fixed to true north. FIELD_YAW_DEG records the
-        true-north bearing of the field's forward direction.
+        N 轴固定指向真北。FIELD_YAW_DEG 记录场地前方方向
+        的真北方位角。
 
-        Args:
-            forward_m: distance along field forward axis (m)
-            right_m:   distance along field right axis (m)
-            height_m:  flight altitude (m, positive up)
+        参数:
+            forward_m: 沿场地前方方向的距离（米）
+            right_m:   沿场地右方方向的距离（米）
+            height_m:  飞行高度（米，向上为正）
 
-        Returns:
-            PositionNedYaw with north, east, down, and yaw set to field heading.
+        返回:
+            PositionNedYaw，包含 north、east、down 以及设为场地航向的 yaw。
         """
         theta = math.radians(self.FIELD_YAW_DEG)
         north_m = forward_m * math.cos(theta) - right_m * math.sin(theta)

@@ -1,50 +1,50 @@
 """
-Global parameters for the CUADC 2026 mission.
+CUADC 2026 任务全局参数。
 
-All state modules import from here — no hardcoded values.
-Tune these before competition based on field measurements.
+所有状态模块从此处导入 —— 禁止硬编码。
+比赛前根据场地实测数据调整这些参数。
 """
 
 # ---------------------------------------------------------------------------
-# Field orientation — auto-detected at arm time.
-# Place the aircraft on the takeoff pad facing the field forward direction;
-# the program reads current heading at arm and overwrites this value.
+# 场地朝向 —— 上锁时自动检测。
+# 将飞机放在起飞点上，机头朝向场地前方；
+# 程序在上锁时读取当前航向并覆盖此值。
 # ---------------------------------------------------------------------------
 FIELD_YAW_DEG = 0.0
 
 # ---------------------------------------------------------------------------
-# Flight parameters
+# 飞行参数
 # ---------------------------------------------------------------------------
-CRUISE_ALTITUDE_M = 7.0          # safe cruise altitude after takeoff
-DROP_ZONE_DISTANCE_M = 30.0      # distance from takeoff to drop zone
-RECON_ZONE_DISTANCE_M = 55.0     # distance from takeoff to recon zone
-DROP_ALIGN_ALTITUDE_M = 2.5      # altitude above cylinder for fine alignment
-RECON_ALTITUDE_M = 2.5           # altitude for recon scanning
-LAND_START_ALTITUDE_M = 5.0      # altitude when starting landing sequence
-LAND_SAFE_ALTITUDE_M = 2.0       # below this altitude, use slow descent
-TRANSIT_SPEED_MPS = 5.0          # cruise speed between zones
+CRUISE_ALTITUDE_M = 7.0          # 起飞后的安全巡航高度
+DROP_ZONE_DISTANCE_M = 30.0      # 起飞点到投掷区的距离
+RECON_ZONE_DISTANCE_M = 55.0     # 起飞点到侦察区的距离
+DROP_ALIGN_ALTITUDE_M = 2.5      # 圆柱体上方精细对准高度
+RECON_ALTITUDE_M = 2.5           # 侦察扫描高度
+LAND_START_ALTITUDE_M = 5.0      # 开始降落序列时的高度
+LAND_SAFE_ALTITUDE_M = 2.0       # 低于此高度时使用慢速下降
+TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度
 
 # ---------------------------------------------------------------------------
-# Control parameters
+# 控制参数
 # ---------------------------------------------------------------------------
-OFFBOARD_HEARTBEAT_HZ = 20       # offboard setpoint send rate (must be >= 2)
-FSM_LOOP_HZ = 20                 # state machine main loop rate
-ALIGN_THRESHOLD_M = 0.05         # visual servoing alignment threshold
-SEARCH_TIMEOUT_S = 3.0           # target re-acquisition timeout
-VISUAL_SERVO_KP = 0.5            # visual servo P-controller gain
-LAND_DESCEND_RATE_MPS = 0.3      # normal descent rate during landing
-DROP_ALTITUDE_M = 5.0            # altitude during drop phase coarse approach
+OFFBOARD_HEARTBEAT_HZ = 20       # offboard 设定值发送频率（须 >= 2 Hz）
+FSM_LOOP_HZ = 20                 # 状态机主循环频率
+ALIGN_THRESHOLD_M = 0.05         # 视觉伺服对准阈值
+SEARCH_TIMEOUT_S = 3.0           # 目标重捕获超时
+VISUAL_SERVO_KP = 0.5            # 视觉伺服 P 控制器增益
+LAND_DESCEND_RATE_MPS = 0.3      # 降落时的正常下降速率
+DROP_ALTITUDE_M = 5.0            # 投掷阶段粗略接近高度
 
 # ---------------------------------------------------------------------------
-# Vision parameters
+# 视觉参数
 # ---------------------------------------------------------------------------
-YOLO_CONFIDENCE_THRESHOLD = 0.5  # YOLO detection confidence threshold
-RECON_CONFIDENCE_THRESHOLD = 0.7 # recon classification confidence threshold
-RECON_SCAN_STEP_M = 1.5          # recon zone scan line spacing
+YOLO_CONFIDENCE_THRESHOLD = 0.5  # YOLO 检测置信度阈值
+RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
+RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
 
 # ---------------------------------------------------------------------------
-# Safety parameters
+# 安全参数
 # ---------------------------------------------------------------------------
-BATTERY_LOW_THRESHOLD_PCT = 20.0 # trigger RTL below this battery percentage
-GPS_FIX_MIN = 3                  # minimum GPS fix type (3 = 3D fix)
-GLOBAL_GUARD_INTERVAL_S = 0.05   # health check interval (match FSM loop rate)
+BATTERY_LOW_THRESHOLD_PCT = 20.0 # 电量低于此百分比时触发返航
+GPS_FIX_MIN = 3                  # 最低 GPS 定位类型（3 = 3D 定位）
+GLOBAL_GUARD_INTERVAL_S = 0.05   # 健康检查间隔（与 FSM 循环频率匹配）

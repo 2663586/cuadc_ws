@@ -1,8 +1,8 @@
 """
-YOLO-based cylinder detector for the drop zone.
+基于 YOLO 的圆柱体检测器，用于投掷区。
 
-Workflow: YOLO coarse detection → HoughCircles fine localisation →
-pinhole model NED offset → cylinder type classification.
+工作流程：YOLO 粗略检测 → HoughCircles 精细定位 →
+针孔模型 NED 偏移 → 圆柱体类型分类。
 """
 
 import cv2
@@ -13,23 +13,23 @@ from typing import List, Optional, Tuple
 from .object_size_calculator import ObjectSizeCalculator
 
 
-# Shared camera handle — initialised once, reused across states.
+# 共享相机句柄 —— 初始化一次，在各状态间复用。
 _camera: Optional[cv2.VideoCapture] = None
 
 
 def init_camera(source=0, width=1280, height=720):
-    """Initialise the global camera handle."""
+    """初始化全局相机句柄。"""
     global _camera
     _camera = cv2.VideoCapture(source)
     _camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     _camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     if not _camera.isOpened():
-        raise RuntimeError(f"Cannot open camera source {source}")
-    print(f"[Vision] Camera opened: {source}, {width}x{height}")
+        raise RuntimeError(f"无法打开相机源 {source}")
+    print(f"[视觉] 相机已打开: {source}, {width}x{height}")
 
 
 def release_camera():
-    """Release the global camera handle."""
+    """释放全局相机句柄。"""
     global _camera
     if _camera is not None:
         _camera.release()
@@ -38,17 +38,17 @@ def release_camera():
 
 @dataclass
 class Cylinder:
-    """Detection result for a single cylinder."""
-    bbox: Tuple[int, int, int, int]       # (x, y, w, h) in pixels
-    center_uv: Tuple[float, float]         # centre in pixel coordinates
-    diameter_px: float                     # detected pixel diameter
-    estimated_diameter_cm: float           # estimated real diameter (cm)
-    ned_offset: Tuple[float, float]        # NED horizontal offset (m)
-    cylinder_type: Optional[int]           # 1=15cm, 2=20cm, 3=25cm, None=uncertain
+    """单个圆柱体的检测结果。"""
+    bbox: Tuple[int, int, int, int]       # (x, y, w, h) 像素坐标
+    center_uv: Tuple[float, float]         # 像素坐标中的中心点
+    diameter_px: float                     # 检测到的像素直径
+    estimated_diameter_cm: float           # 估算的实际直径（厘米）
+    ned_offset: Tuple[float, float]        # NED 水平偏移（米）
+    cylinder_type: Optional[int]           # 1=15厘米, 2=20厘米, 3=25厘米, None=不确定
 
 
 class YOLODetector:
-    """YOLO + HoughCircles cylinder detector with pinhole-model localisation."""
+    """YOLO + HoughCircles 圆柱体检测器，带针孔模型定位。"""
 
     CYLINDER_DIAMETERS = {1: 0.15, 2: 0.20, 3: 0.25}
 
@@ -58,7 +58,7 @@ class YOLODetector:
         self.confidence_threshold = confidence_threshold
         self.calc = ObjectSizeCalculator(camera_matrix, dist_coeffs)
 
-        # Lazy-load YOLO
+        # 延迟加载 YOLO
         self._model_path = model_path
         self._yolo = None
 
@@ -72,19 +72,19 @@ class YOLODetector:
     def detect_cylinders(self, frame: np.ndarray,
                          flight_altitude: float) -> List[Cylinder]:
         """
-        Full detection pipeline for a single frame.
+        单帧的完整检测流水线。
 
-        Args:
-            frame: BGR image from downward-facing camera.
-            flight_altitude: height above ground (m).
+        参数:
+            frame: 来自下视摄像头的 BGR 图像。
+            flight_altitude: 离地高度（米）。
 
-        Returns:
-            Detected cylinders sorted by estimated diameter (smallest first).
+        返回:
+            检测到的圆柱体列表，按估算直径排序（最小的在前）。
         """
         results = []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Distance from camera to cylinder top (cylinder height = 0.30 m)
+        # 相机到圆柱体顶部的距离（圆柱体高度 = 0.30 米）
         camera_to_cylinder_z = flight_altitude - 0.30
         if camera_to_cylinder_z <= 0:
             return results
@@ -97,7 +97,7 @@ class YOLODetector:
             if conf < self.confidence_threshold:
                 continue
 
-            # ROI for HoughCircles
+            # HoughCircles 感兴趣区域
             margin = 10
             x1c = max(x1 - margin, 0)
             y1c = max(y1 - margin, 0)
@@ -122,12 +122,12 @@ class YOLODetector:
             cx = cx_roi + x1c
             cy = cy_roi + y1c
 
-            # Real diameter from pinhole model
+            # 通过针孔模型计算实际直径
             real_w, _ = self.calc.compute_real_size(
                 radius * 2, radius * 2, camera_to_cylinder_z
             )
 
-            # NED offset
+            # NED 偏移
             offset_x, offset_y = self.calc.pixel_to_ned_offset(
                 cx, cy, camera_to_cylinder_z
             )
@@ -150,8 +150,8 @@ class YOLODetector:
     def select_targets(self, cylinders: List[Cylinder]
                        ) -> Tuple[Cylinder, Cylinder]:
         """
-        Select two drop targets from detected cylinders.
-        Prefers type 1 (15 cm, 500 pts) then type 2 (20 cm, 300 pts).
+        从检测到的圆柱体中选择两个投放目标。
+        优先选择类型 1（15 厘米，500 分），然后类型 2（20 厘米，300 分）。
         """
         type1 = [c for c in cylinders if c.cylinder_type == 1]
         type2 = [c for c in cylinders if c.cylinder_type == 2]
@@ -170,20 +170,20 @@ class YOLODetector:
         return first, second
 
     # ------------------------------------------------------------------
-    # Helpers
+    # 辅助方法
     # ------------------------------------------------------------------
 
     def _estimate_radius_range(self, altitude: float) -> Tuple[int, int]:
-        """Estimate pixel-radius range for HoughCircles based on altitude."""
-        # 15 cm cylinder: r_px = (0.15 * fx) / (2 * altitude)
+        """根据高度估算 HoughCircles 的像素半径范围。"""
+        # 15 厘米圆柱体: r_px = (0.15 * fx) / (2 * altitude)
         min_r = int((0.15 * self.calc.fx) / (2 * altitude) * 0.7)
-        # 25 cm cylinder
+        # 25 厘米圆柱体
         max_r = int((0.25 * self.calc.fx) / (2 * altitude) * 1.3)
         return max(min_r, 3), max(max_r, 5)
 
     def _classify_cylinder(self, estimated_diameter_m: float,
                            altitude: float) -> Optional[int]:
-        """Classify cylinder type from estimated diameter."""
+        """从估算直径分类圆柱体类型。"""
         d_cm = estimated_diameter_m * 100
 
         if altitude < 3.0:
@@ -205,7 +205,7 @@ class YOLODetector:
 
     def cover_zone_check(self, flight_altitude: float,
                          zone_size: Tuple[float, float]) -> bool:
-        """Check whether the camera FOV covers the full zone at a given altitude."""
+        """检查在给定高度下相机视场是否覆盖整个区域。"""
         import math
         h_fov = 2 * math.atan(self.calc.cx / self.calc.fx)
         v_fov = 2 * math.atan(self.calc.cy / self.calc.fy)
@@ -215,12 +215,12 @@ class YOLODetector:
 
 
 # ------------------------------------------------------------------
-# Module-level singleton for convenience
+# 模块级单例，方便使用
 # ------------------------------------------------------------------
 
 _detector: Optional[YOLODetector] = None
 
-# Default camera matrix (placeholder — calibrate before competition)
+# 默认相机矩阵（占位值 —— 比赛前需标定）
 _DEFAULT_K = np.array([
     [800.0, 0.0, 640.0],
     [0.0, 800.0, 480.0],
@@ -230,7 +230,7 @@ _DEFAULT_K = np.array([
 
 def get_detector(model_path: str = "models/cylinder_yolov8n.pt",
                  camera_matrix: np.ndarray = None) -> YOLODetector:
-    """Get or create the singleton detector instance."""
+    """获取或创建单例检测器实例。"""
     global _detector
     if _detector is None:
         if camera_matrix is None:

@@ -1,8 +1,8 @@
 """
-Black-box logger — records mission data for post-flight analysis and debugging.
+黑匣子日志记录器 —— 记录任务数据用于事后分析和调试。
 
-Logs state transitions, telemetry snapshots, vision results, and drop events
-to a timestamped file under logs/.
+将状态转换、遥测快照、视觉结果和投放事件记录到
+logs/ 目录下的带时间戳的文件中。
 """
 
 import json
@@ -15,7 +15,7 @@ from interface import HealthStatus
 
 
 class LoggerManager:
-    """Mission black-box logger."""
+    """任务黑匣子日志记录器。"""
 
     def __init__(self, log_dir: str = "./logs"):
         self.log_dir = Path(log_dir)
@@ -23,7 +23,7 @@ class LoggerManager:
         self.log_file = self.log_dir / \
             f"mission_{datetime.now():%Y%m%d_%H%M%S}.log"
         self._start_time = time.monotonic()
-        print(f"[Logger] Recording to {self.log_file}")
+        print(f"[日志] 记录到 {self.log_file}")
 
     def _write(self, entry: dict):
         entry["t"] = time.monotonic() - self._start_time
@@ -72,7 +72,7 @@ class LoggerManager:
         })
 
     def log_event(self, event: str, **kwargs):
-        """Generic event logger."""
+        """通用事件日志记录器。"""
         entry = {"type": "event", "event": event}
         entry.update(kwargs)
         self._write(entry)
