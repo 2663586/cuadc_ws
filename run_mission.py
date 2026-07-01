@@ -60,8 +60,8 @@ if __name__ == "__main__":
         description="CUADC 2026 autonomous mission controller"
     )
     parser.add_argument(
-        "--address", default="udp://:14540",
-        help="PX4 MAVLink address (default: udp://:14540)"
+        "--address", default="udp://0.0.0.0:14540",
+        help="PX4 MAVLink address (default: udp://0.0.0.0:14540)"
     )
     parser.add_argument(
         "--sim", action="store_true",

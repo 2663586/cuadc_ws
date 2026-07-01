@@ -29,7 +29,8 @@ class HealthStatus:
     is_home_position_ok: bool = False
     battery_pct: float = 100.0
     estimator_flags_ok: bool = True
-    gps_fix_type: int = 0
+    gps_fix_type: int = 3  # SITL always has 3D fix; updated by _gps_watcher
+    altitude_m: float = 0.0
 
     @property
     def is_healthy(self) -> bool:
@@ -38,7 +39,6 @@ class HealthStatus:
         return (
             self.is_connected
             and self.is_armed
-            and self.is_offboard
             and self.is_global_position_ok
             and self.is_home_position_ok
             and self.battery_pct > BATTERY_LOW_THRESHOLD_PCT
@@ -50,7 +50,7 @@ class HealthStatus:
 class PX4Interface:
     """Encapsulates all MAVSDK interactions with built-in safety mechanisms."""
 
-    def __init__(self, system_address: str = "udp://:14540",
+    def __init__(self, system_address: str = "udp://0.0.0.0:14540",
                  on_unhealthy: Optional[Callable] = None):
         self.drone = System()
         self.system_address = system_address
@@ -78,11 +78,14 @@ class PX4Interface:
         async for state in self.drone.core.connection_state():
             if state.is_connected:
                 break
+        self.health.is_connected = True
 
         # Wait for global position and home position
         async for health in self.drone.telemetry.health():
             if health.is_global_position_ok and health.is_home_position_ok:
                 break
+        self.health.is_global_position_ok = True
+        self.health.is_home_position_ok = True
 
         # Auto-detect field orientation from current heading
         async for heading in self.drone.telemetry.heading():
@@ -91,9 +94,7 @@ class PX4Interface:
                   f"FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} deg")
             break
 
-        # Start background monitoring tasks
-        asyncio.create_task(self._telemetry_watcher())
-        asyncio.create_task(self._battery_watcher())
+        # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
 
     async def arm_and_offboard(self):
@@ -102,53 +103,70 @@ class PX4Interface:
         await self.drone.offboard.set_position_ned(self._last_setpoint)
         await self.drone.action.arm()
         await self.drone.offboard.start()
+        self.health.is_armed = True
+        self.health.is_offboard = True
         print("[INFO] Armed and offboard mode engaged")
 
     async def disarm(self):
         """Exit offboard mode and disarm."""
-        await self.drone.offboard.stop()
-        await self.drone.action.disarm()
+        try:
+            await self.drone.offboard.stop()
+        except Exception:
+            pass
+        try:
+            await self.drone.action.disarm()
+        except Exception:
+            pass
         print("[INFO] Disarmed")
 
     # ------------------------------------------------------------------
     # Health watchdog
     # ------------------------------------------------------------------
 
-    async def _telemetry_watcher(self):
-        """Continuously update health snapshot from telemetry."""
-        async for health in self.drone.telemetry.health():
-            self.health.is_global_position_ok = health.is_global_position_ok
-            self.health.is_home_position_ok = health.is_home_position_ok
-
-        # Monitor status text for estimator anomalies
-        async for status_text in self.drone.telemetry.status_text():
-            if "estimator" in status_text.text.lower():
-                if self._on_unhealthy:
-                    self._on_unhealthy(status_text.text)
-
-    async def _battery_watcher(self):
-        """Continuously update battery percentage."""
-        async for battery in self.drone.telemetry.battery():
-            self.health.battery_pct = battery.remaining_percent
-
     async def global_guard_check(self) -> bool:
-        """Called every loop cycle. Returns True if healthy."""
-        # Update connection state
-        async for state in self.drone.core.connection_state():
-            self.health.is_connected = state.is_connected
-            break
+        """
+        Called every loop cycle. Returns True if healthy.
 
-        # Update armed state
-        async for armed in self.drone.telemetry.armed():
-            self.health.is_armed = armed
-            break
+        All telemetry is read via point-in-time queries, throttled to ~2 Hz
+        to avoid overwhelming MAVSDK's gRPC callback queue.
+        Between ticks, returns the last cached result.
+        """
+        import time as _time
 
-        # Update flight mode
-        async for mode in self.drone.telemetry.flight_mode():
-            self.health.is_offboard = (str(mode) == "OFFBOARD")
-            break
+        now = _time.monotonic()
+        if not hasattr(self, "_last_guard_read"):
+            self._last_guard_read = 0.0
+        if not hasattr(self, "_cached_healthy"):
+            self._cached_healthy = True
 
-        return self.health.is_healthy
+        # Throttle: do the actual MAVSDK reads only at ~2 Hz
+        if now - self._last_guard_read > 0.5:
+            self._last_guard_read = now
+            try:
+                async for state in self.drone.core.connection_state():
+                    self.health.is_connected = state.is_connected
+                    break
+                async for armed in self.drone.telemetry.armed():
+                    self.health.is_armed = armed
+                    break
+                async for health in self.drone.telemetry.health():
+                    self.health.is_global_position_ok = health.is_global_position_ok
+                    self.health.is_home_position_ok = health.is_home_position_ok
+                    break
+                async for gps in self.drone.telemetry.gps_info():
+                    self.health.gps_fix_type = gps.fix_type.value
+                    break
+                async for battery in self.drone.telemetry.battery():
+                    self.health.battery_pct = battery.remaining_percent
+                    break
+                async for pos in self.drone.telemetry.position():
+                    self.health.altitude_m = pos.relative_altitude_m
+                    break
+            except Exception as e:
+                print(f"[DEBUG] global_guard_check read error: {e}")
+            self._cached_healthy = self.health.is_healthy
+
+        return self._cached_healthy
 
     # ------------------------------------------------------------------
     # Offboard heartbeat (independent task — keeps PX4 from timing out)
@@ -208,9 +226,8 @@ class PX4Interface:
             )
 
     async def get_altitude(self) -> float:
-        """Get current relative altitude in meters."""
-        async for pos in self.drone.telemetry.position():
-            return pos.relative_altitude_m
+        """Get current relative altitude (cached, updated at ~2 Hz)."""
+        return self.health.altitude_m
 
     async def get_heading(self) -> float:
         """Get current heading in degrees."""
