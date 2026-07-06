@@ -10,11 +10,13 @@ import time
 from typing import Optional
 
 from interface import PX4Interface
-from config import FSM_LOOP_HZ
+from config import FSM_LOOP_HZ, BOTTLE1_SERVO_INDEX
 from logger_manager import get_logger
 from states.base_state import BaseState
 from states.takeoff import TakeoffState
 from states.hover import HoverState
+from states.drop import DropState
+from states.transit import TransitState
 from states.land import PrecisionLandState
 
 
@@ -33,8 +35,11 @@ class MissionFSM:
     def build_mission(self):
         """构建任务序列。"""
         self.mission_queue = [
-            TakeoffState(target_alt=5.0, timeout_s=30),
-            HoverState(hover_time=1.0),
+            TakeoffState(target_alt=6.0, timeout_s=30),
+            HoverState(hover_time=5.0),
+            DropState(servo_index=BOTTLE1_SERVO_INDEX, timeout_s=10),
+            HoverState(hover_time=20.0),
+            TransitState(x=0.0, y=-3.0, z=6.0, speed=3.0, timeout_s=30),
             PrecisionLandState(timeout_s=60),
         ]
         self.state_index = 0

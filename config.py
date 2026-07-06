@@ -44,8 +44,13 @@ RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
 RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
 
 # ---------------------------------------------------------------------------
-# 安全参数
+# 舵机参数
 # ---------------------------------------------------------------------------
+# Pixhawk 4 FMU PWM OUT (AUX 8 通道) → MavSDK set_actuator index:
+#   MAIN1..8 = 1..8    FMU/AUX1..8 = 9..16
+#   最后两个: AUX7=15  AUX8=16
+BOTTLE1_SERVO_INDEX = 15           # 瓶子 1 舵机 → FMU PWM 7 (AUX7)
+BOTTLE2_SERVO_INDEX = 16           # 瓶子 2 舵机 → FMU PWM 8 (AUX8)
 BATTERY_LOW_THRESHOLD_PCT = 20.0 # 电量低于此百分比时触发返航
 GPS_FIX_MIN = 3                  # 最低 GPS 定位类型（3 = 3D 定位）
 GLOBAL_GUARD_INTERVAL_S = 0.05   # 健康检查间隔（与 FSM 循环频率匹配）
