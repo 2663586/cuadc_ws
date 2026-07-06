@@ -186,6 +186,8 @@ arm → Takeoff(7m) → Hover(1s) → Transit(30m) → Hover(1s)
 ## TODO:
 
 [x] 在`main_fsm.py`中的`_handle_unhealthy`处理：怎么处理？合理性？
+[] 坐标系转换问题
+[] 心跳问题
 
 ## 许可证
 
