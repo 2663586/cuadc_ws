@@ -16,11 +16,6 @@ from config import FSM_LOOP_HZ
 from states.base_state import BaseState
 from states.takeoff import TakeoffState
 from states.hover import HoverState
-from states.transit import TransitState
-from states.search import SearchState
-from states.align import AlignState
-from states.drop import DropState
-from states.recon import ReconState
 from states.land import PrecisionLandState
 
 
@@ -38,33 +33,8 @@ class MissionFSM:
 
     def build_mission(self):
         """构建任务序列。"""
-        from config import (
-            CRUISE_ALTITUDE_M, DROP_ZONE_DISTANCE_M, RECON_ZONE_DISTANCE_M,
-            LAND_START_ALTITUDE_M, TRANSIT_SPEED_MPS,
-        )
-
         self.mission_queue = [
-            TakeoffState(target_alt=CRUISE_ALTITUDE_M, timeout_s=30),
-            HoverState(hover_time=1.0),
-
-            TransitState(x=DROP_ZONE_DISTANCE_M, y=0.0, z=CRUISE_ALTITUDE_M,
-                         speed=TRANSIT_SPEED_MPS, timeout_s=30),
-            HoverState(hover_time=1.0),
-
-            # 投掷阶段：先进行一次粗略检测，然后对每个瓶子进行对准 + 投放
-            SearchState(timeout_s=30),
-            AlignState(bottle_index=1, timeout_s=60),
-            DropState(bottle_index=1, timeout_s=10),
-            AlignState(bottle_index=2, timeout_s=60),
-            DropState(bottle_index=2, timeout_s=10),
-
-            TransitState(x=RECON_ZONE_DISTANCE_M, y=0.0, z=CRUISE_ALTITUDE_M,
-                         speed=TRANSIT_SPEED_MPS, timeout_s=30),
-            HoverState(hover_time=1.0),
-            ReconState(timeout_s=120),
-
-            TransitState(x=0.0, y=0.0, z=LAND_START_ALTITUDE_M,
-                         speed=TRANSIT_SPEED_MPS, timeout_s=60),
+            TakeoffState(target_alt=5.0, timeout_s=30),
             HoverState(hover_time=1.0),
             PrecisionLandState(timeout_s=60),
         ]

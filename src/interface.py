@@ -79,6 +79,7 @@ class PX4Interface:
             if state.is_connected:
                 break
         self.health.is_connected = True
+        print("[信息] 已连接到飞控")
 
         # 等待全局位置和家点位置
         async for health in self.drone.telemetry.health():
@@ -86,6 +87,7 @@ class PX4Interface:
                 break
         self.health.is_global_position_ok = True
         self.health.is_home_position_ok = True
+        print("[信息] GPS 已锁定，家点位置已记录")
 
         # 从当前航向自动检测场地朝向
         async for heading in self.drone.telemetry.heading():
