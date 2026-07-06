@@ -15,7 +15,8 @@ from logger_manager import get_logger
 from states.base_state import BaseState
 from states.takeoff import TakeoffState
 from states.hover import HoverState
-from states.land import PrecisionLandState
+from states.transit import TransitState
+from states.land_in_place import LandInPlaceState
 
 
 class MissionFSM:
@@ -34,8 +35,9 @@ class MissionFSM:
         """构建任务序列。"""
         self.mission_queue = [
             TakeoffState(target_alt=5.0, timeout_s=30),
-            HoverState(hover_time=1.0),
-            PrecisionLandState(timeout_s=60),
+            HoverState(hover_time=5.0),
+            TransitState(x=5.0, y=0.0, z=5.0, speed=5.0, timeout_s=30),
+            LandInPlaceState(timeout_s=60),
         ]
         self.state_index = 0
 
