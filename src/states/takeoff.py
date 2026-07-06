@@ -1,21 +1,22 @@
-"""起飞状态 —— 爬升至目标高度。"""
+"""起飞状态 —— 通过 offboard setpoint 爬升至目标高度。"""
 
 from .base_state import BaseState
+from config import TAKEOFF_COMPLETE_THRESHOLD
 
 
 class TakeoffState(BaseState):
-    """上锁 + offboard 后爬升至目标高度。"""
+    """通过 offboard set_position_ned 爬升至目标高度。"""
 
-    def __init__(self, target_alt: float = 7.0, timeout_s: float = 30):
+    def __init__(self, target_alt: float = 5.0, timeout_s: float = 30):
         super().__init__("Takeoff", timeout_s)
         self.target_alt = target_alt
 
     async def enter(self, interface):
         await super().enter(interface)
-        # 设定起飞高度并指令起飞
+        # 发布目标高度 setpoint，心跳循环以 20 Hz 持续发送
         sp = interface.field_to_ned(0.0, 0.0, self.target_alt)
         interface.update_setpoint(sp)
-        await interface.takeoff(self.target_alt)
+        print(f"[起飞] 目标高度 {self.target_alt:.1f} 米")
 
     async def execute(self, interface):
         if self.is_timed_out():
@@ -23,7 +24,12 @@ class TakeoffState(BaseState):
             return True, None
 
         alt = await interface.get_altitude()
-        if alt >= self.target_alt * 0.9:
+        error = abs(alt - self.target_alt) / self.target_alt
+
+        if error < TAKEOFF_COMPLETE_THRESHOLD:
             self.is_completed = True
+            print(f"[起飞] 已到达目标高度 {alt:.1f} 米 "
+                  f"(误差 {error:.1%})")
             return True, None
+
         return False, None

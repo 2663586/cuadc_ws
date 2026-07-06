@@ -183,6 +183,10 @@ arm → Takeoff(7m) → Hover(1s) → Transit(30m) → Hover(1s)
 - **摄像头**：Gazebo 仿真中相机需额外配置，当前视觉状态在仿真中会因摄像头未初始化而超时跳过
 - **Python 缓冲**：调试时使用 `PYTHONUNBUFFERED=1` 确保实时输出
 
+## TODO:
+
+[] 在`main_fsm.py`中的`_handle_unhealthy`处理：怎么处理？合理性？
+
 ## 许可证
 
 CUADC 2026 竞赛项目 — 仅供团队内部使用

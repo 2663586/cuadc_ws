@@ -29,6 +29,7 @@ TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度
 # ---------------------------------------------------------------------------
 OFFBOARD_HEARTBEAT_HZ = 20       # offboard 设定值发送频率（须 >= 2 Hz）
 FSM_LOOP_HZ = 20                 # 状态机主循环频率
+TAKEOFF_COMPLETE_THRESHOLD = 0.10  # 起飞完成判据：相对误差小于此值即认为到达目标高度
 ALIGN_THRESHOLD_M = 0.05         # 视觉伺服对准阈值
 SEARCH_TIMEOUT_S = 3.0           # 目标重捕获超时
 VISUAL_SERVO_KP = 0.5            # 视觉伺服 P 控制器增益

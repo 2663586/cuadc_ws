@@ -6,7 +6,7 @@ PX4 通信层 —— 封装所有 MAVSDK 交互。
 - Offboard 心跳循环（独立 asyncio 任务，20 Hz）
 - 遥测监控（健康状态、电量、连接状态）
 - 场地坐标到 NED 坐标的转换
-- 高级指令（起飞、降落、舵机控制）
+- 高级指令（降落、舵机控制）
 """
 
 import asyncio
@@ -197,19 +197,13 @@ class PX4Interface:
     # 高级指令
     # ------------------------------------------------------------------
 
-    async def takeoff(self, altitude_m: float):
-        """指令起飞到指定高度。"""
-        await self.drone.action.set_takeoff_altitude(altitude_m)
-        await self.drone.action.takeoff()
-        print(f"[指令] 起飞至 {altitude_m:.1f} 米")
-
     async def set_actuator(self, index: int, value: float):
         """通过 AUX 输出控制舵机（例如投放舵机）。"""
         await self.drone.action.set_actuator(index, value)
         print(f"[指令] 舵机 {index} -> {value:.2f}")
 
     async def land(self):
-        """指令自动降落。"""
+        """指令自动降落。（垂直下降）"""
         await self.drone.action.land()
         print("[指令] 降落")
 
