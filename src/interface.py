@@ -16,6 +16,7 @@ from typing import Optional, Callable
 
 from mavsdk import System
 from mavsdk.offboard import PositionNedYaw
+from logger_manager import get_logger
 
 
 @dataclass
@@ -80,6 +81,7 @@ class PX4Interface:
                 break
         self.health.is_connected = True
         print("[信息] 已连接到飞控")
+        get_logger().log_message("info", "已连接到飞控")
 
         # 等待全局位置和家点位置
         async for health in self.drone.telemetry.health():
@@ -88,12 +90,16 @@ class PX4Interface:
         self.health.is_global_position_ok = True
         self.health.is_home_position_ok = True
         print("[信息] GPS 已锁定，家点位置已记录")
+        get_logger().log_message("info", "GPS 已锁定，家点位置已记录")
 
         # 从当前航向自动检测场地朝向
         async for heading in self.drone.telemetry.heading():
             self.FIELD_YAW_DEG = heading.heading_deg
             print(f"[信息] 场地朝向自动检测: "
                   f"FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度")
+            get_logger().log_message(
+                "info",
+                f"场地朝向自动检测: FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度")
             break
 
         # 启动后台任务
@@ -108,6 +114,7 @@ class PX4Interface:
         self.health.is_armed = True
         self.health.is_offboard = True
         print("[信息] 已上锁，offboard 模式已启用")
+        get_logger().log_message("info", "已上锁，offboard 模式已启用")
 
     async def disarm(self):
         """退出 offboard 模式并断开上锁。"""
@@ -120,6 +127,7 @@ class PX4Interface:
         except Exception:
             pass
         print("[信息] 已断开上锁")
+        get_logger().log_message("info", "已断开上锁")
 
     # ------------------------------------------------------------------
     # 健康看门狗
@@ -166,6 +174,8 @@ class PX4Interface:
                     break
             except Exception as e:
                 print(f"[调试] global_guard_check 读取错误: {e}")
+                get_logger().log_message(
+                    "debug", f"global_guard_check 读取错误: {e}", "fail")
             self._cached_healthy = self.health.is_healthy
 
         return self._cached_healthy
@@ -201,11 +211,13 @@ class PX4Interface:
         """通过 AUX 输出控制舵机（例如投放舵机）。"""
         await self.drone.action.set_actuator(index, value)
         print(f"[指令] 舵机 {index} -> {value:.2f}")
+        get_logger().log_message("command", f"舵机 {index} -> {value:.2f}")
 
     async def land(self):
         """指令自动降落。（垂直下降）"""
         await self.drone.action.land()
         print("[指令] 降落")
+        get_logger().log_message("command", "降落")
 
     # ------------------------------------------------------------------
     # 遥测查询（快照读取）

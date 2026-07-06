@@ -9,10 +9,9 @@ import asyncio
 import time
 from typing import Optional
 
-from mavsdk.offboard import PositionNedYaw
-
 from interface import PX4Interface
 from config import FSM_LOOP_HZ
+from logger_manager import get_logger
 from states.base_state import BaseState
 from states.takeoff import TakeoffState
 from states.hover import HoverState
@@ -56,6 +55,8 @@ class MissionFSM:
                 break
 
             # ---- 进入状态 ----
+            prev_state = self.current_state.name if self.current_state else "start"
+            get_logger().log_state_transition(prev_state, state.name)
             await state.enter(self.interface)
 
             # ---- 执行循环 ----
@@ -82,23 +83,82 @@ class MissionFSM:
             if state.is_timed_out() and not state.is_completed:
                 print(f"[警告] {state.name} 超时 ({state.timeout_s}秒)，"
                       f"跳过")
+                get_logger().log_message(
+                    "warning", f"{state.name} 超时 ({state.timeout_s}秒)，跳过",
+                    "timeout")
 
             self.state_index += 1
 
-        # 任务完成
+        # 任务结束 —— 以飞控实际状态为准，确保安全断开上锁
+        await self._ensure_disarmed()
+
+    # ------------------------------------------------------------------
+    # 安全收尾
+    # ------------------------------------------------------------------
+
+    async def _ensure_disarmed(self):
+        """
+        确保飞控已安全断开上锁。
+
+        正常流程中，PX4 Land 模式着陆后会自动 disarm；
+        此方法检测实际状态，必要时发送 disarm 并等待确认。
+        若 disarm 失败，尝试 RTL 作为最后手段。
+        """
+        if not await self._is_armed():
+            print("[信息] 任务完成，飞控已断开上锁")
+            get_logger().log_message("info", "任务完成，飞控已断开上锁")
+            return
+
+        # 仍在上锁状态 —— 发送 disarm 并等待确认
+        print("[信息] 发送 disarm 指令...")
         await self.interface.disarm()
-        print("[信息] 任务完成")
+
+        if await self._wait_for_disarm(timeout=5.0):
+            print("[信息] 任务完成，飞控已断开上锁")
+            get_logger().log_message("info", "任务完成，飞控已断开上锁")
+            return
+
+        # disarm 失败 —— 降级为 RTL
+        print("[错误] disarm 失败，飞控未响应 —— 尝试 RTL 作为最后手段")
+        get_logger().log_message(
+            "error", "disarm 失败，飞控未响应，尝试 RTL", "fail")
+        try:
+            await self.interface.drone.action.return_to_launch()
+        except Exception as e:
+            print(f"[致命错误] RTL 也失败了: {e}")
+            get_logger().log_message(
+                "fatal", f"RTL 失败: {e}", "fail")
+
+    async def _is_armed(self) -> bool:
+        """查询飞控当前是否处于上锁状态（单次快照）。"""
+        async for armed in self.interface.drone.telemetry.armed():
+            return armed
+
+    async def _wait_for_disarm(self, timeout: float = 5.0) -> bool:
+        """等待飞控断开上锁，返回 True 表示成功断开。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not await self._is_armed():
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
     async def _handle_unhealthy(self, reason: str):
-        """紧急情况：健康检查失败时强制悬停。"""
+        """紧急情况：健康检查失败时触发 RTL 自主返航降落。"""
         print(f"[紧急] 全局健康检查失败: {reason}")
-        self.interface.update_setpoint(
-            PositionNedYaw(0.0, 0.0, 0.0, 0.0)
-        )
+        print("[紧急] 触发 RTL 返航 —— PX4 将自主爬升、返航、降落")
+        get_logger().log_message(
+            "emergency", f"全局健康检查失败: {reason}", "fail")
+        get_logger().log_message(
+            "emergency", "触发 RTL 返航 —— PX4 将自主爬升、返航、降落")
+        await self.interface.drone.action.return_to_launch()
 
     async def _handle_state_error(self, state: BaseState, error: Exception):
         """状态执行错误的统一处理。"""
         print(f"[错误] {state.name} 抛出异常: {error}")
-        self.interface.update_setpoint(
-            PositionNedYaw(0.0, 0.0, 0.0, 0.0)
-        )
+        print("[紧急] 触发 RTL 返航")
+        get_logger().log_message(
+            "error", f"{state.name} 抛出异常: {error}", "fail")
+        get_logger().log_message(
+            "emergency", "触发 RTL 返航")
+        await self.interface.drone.action.return_to_launch()

@@ -2,6 +2,7 @@
 
 from .base_state import BaseState
 from config import TAKEOFF_COMPLETE_THRESHOLD
+from logger_manager import get_logger
 
 
 class TakeoffState(BaseState):
@@ -17,10 +18,13 @@ class TakeoffState(BaseState):
         sp = interface.field_to_ned(0.0, 0.0, self.target_alt)
         interface.update_setpoint(sp)
         print(f"[起飞] 目标高度 {self.target_alt:.1f} 米")
+        get_logger().log_message(
+            "takeoff", f"目标高度 {self.target_alt:.1f} 米")
 
     async def execute(self, interface):
         if self.is_timed_out():
             self.error = "起飞超时"
+            get_logger().log_message("takeoff", "起飞超时", "timeout")
             return True, None
 
         alt = await interface.get_altitude()
@@ -30,6 +34,9 @@ class TakeoffState(BaseState):
             self.is_completed = True
             print(f"[起飞] 已到达目标高度 {alt:.1f} 米 "
                   f"(误差 {error:.1%})")
+            get_logger().log_message(
+                "takeoff",
+                f"已到达目标高度 {alt:.1f} 米 (误差 {error:.1%})")
             return True, None
 
         return False, None

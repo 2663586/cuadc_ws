@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from interface import PX4Interface
 from main_fsm import MissionFSM
-from logger_manager import LoggerManager
+from logger_manager import init_logger
 
 
 async def main(system_address: str = "udp://:14540", sim: bool = False):
@@ -30,7 +30,10 @@ async def main(system_address: str = "udp://:14540", sim: bool = False):
     print("=" * 60)
 
     # 初始化日志记录器
-    logger = LoggerManager()
+    logger = init_logger()
+    logger.log_message("info", "CUADC 2026 — 自主任务控制器")
+    logger.log_message("info", f"PX4 地址: {system_address}")
+    logger.log_message("info", f"模式: {'仿真' if sim else '实机'}")
 
     # 初始化通信层
     interface = PX4Interface(system_address=system_address)
@@ -42,10 +45,12 @@ async def main(system_address: str = "udp://:14540", sim: bool = False):
         logger.log_event("mission_complete")
     except KeyboardInterrupt:
         print("\n[中止] 手动中断 — 紧急降落")
+        logger.log_message("abort", "手动中断 — 紧急降落", "fail")
         logger.log_event("abort", reason="keyboard_interrupt")
         await interface.land()
     except Exception as e:
         print(f"\n[致命错误] 未处理的异常: {e}")
+        logger.log_message("fatal", f"未处理的异常: {e}", "fail")
         logger.log_event("fatal", error=str(e))
         try:
             await interface.land()
@@ -53,6 +58,7 @@ async def main(system_address: str = "udp://:14540", sim: bool = False):
             pass
     finally:
         print("[信息] 任务结束")
+        logger.log_message("info", "任务结束")
 
 
 if __name__ == "__main__":
