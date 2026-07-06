@@ -1,6 +1,6 @@
 """起飞状态 —— 通过 offboard setpoint 爬升至目标高度。"""
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 from config import TAKEOFF_COMPLETE_THRESHOLD
 from logger_manager import get_logger
 
@@ -25,7 +25,7 @@ class TakeoffState(BaseState):
         if self.is_timed_out():
             self.error = "起飞超时"
             get_logger().log_message("takeoff", "起飞超时", "timeout")
-            return True, None
+            return ExecutionResult(done=True)
 
         alt = await interface.get_altitude()
         error = abs(alt - self.target_alt) / self.target_alt
@@ -37,6 +37,6 @@ class TakeoffState(BaseState):
             get_logger().log_message(
                 "takeoff",
                 f"已到达目标高度 {alt:.1f} 米 (误差 {error:.1%})")
-            return True, None
+            return ExecutionResult(done=True)
 
-        return False, None
+        return ExecutionResult()

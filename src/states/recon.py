@@ -6,7 +6,7 @@
 不进行机载分类 —— 地面站人员观看视频流进行判读。
 """
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 from config import RECON_ZONE_DISTANCE_M, RECON_ALTITUDE_M, RECON_SCAN_STEP_M
 
 
@@ -48,12 +48,12 @@ class ReconState(BaseState):
     async def execute(self, interface):
         if self.is_timed_out():
             self.error = "侦察超时 —— 部分扫描结果仍可使用"
-            return True, None
+            return ExecutionResult(done=True)
 
         if self._current_wp >= len(self._waypoints):
             print("[侦察] 扫描完成")
             self.is_completed = True
-            return True, None
+            return ExecutionResult(done=True)
 
         wp_x, wp_y, wp_z = self._waypoints[self._current_wp]
         alt = await interface.get_altitude()
@@ -71,4 +71,4 @@ class ReconState(BaseState):
                 interface.update_setpoint(sp)
                 print(f"[侦察] 航点 {self._current_wp}/{len(self._waypoints)}")
 
-        return False, None
+        return ExecutionResult()

@@ -1,43 +1,55 @@
 """
-任务有限状态机引擎。
+任务有限状态机引擎 —— 栈式抢占架构。
 
-管理任务队列，循环执行各状态，
-每次迭代执行全局健康检查，并处理错误/超时。
+管理状态栈，循环执行栈顶状态，
+每次迭代执行全局健康检查。
+支持抢占（suspend/resume）和不可恢复中断（清空栈）。
 """
 
 import asyncio
 import time
-from typing import Optional
 
 from interface import PX4Interface
-from config import FSM_LOOP_HZ
+from config import FSM_LOOP_HZ, MAX_STACK_DEPTH
 from logger_manager import get_logger
 from states.base_state import BaseState
 from states.takeoff import TakeoffState
 from states.hover import HoverState
-from states.land import PrecisionLandState
+from states.transit import TransitState
+from states.land_in_place import LandInPlaceState
 
 
 class MissionFSM:
-    """任务状态机引擎。"""
+    """栈式抢占任务状态机引擎。"""
 
     def __init__(self, interface: PX4Interface):
         self.interface = interface
-        self.mission_queue: list[BaseState] = []
-        self.current_state: Optional[BaseState] = None
-        self.state_index = 0
+        self._stack: list[BaseState] = []
 
         # 注册不健康回调
         interface._on_unhealthy = self._handle_unhealthy
 
     def build_mission(self):
-        """构建任务序列。"""
-        self.mission_queue = [
-            TakeoffState(target_alt=5.0, timeout_s=30),
-            HoverState(hover_time=1.0),
-            PrecisionLandState(timeout_s=60),
+        """
+        构建任务栈。
+
+        栈顶（list[-1]）先执行，完成弹出后下一层接管。
+        所以构建顺序与执行顺序相反：
+            LandInPlace（栈底，最后执行）
+            Transit
+            Hover
+            Takeoff（栈顶，最先执行）
+        """
+        self._stack = [
+            LandInPlaceState(timeout_s=60),                         # 栈底 — 最后
+            TransitState(x=5.0, y=0.0, z=5.0, speed=5.0, timeout_s=30),
+            HoverState(hover_time=5.0),
+            TakeoffState(target_alt=5.0, timeout_s=30),             # 栈顶 — 最先
         ]
-        self.state_index = 0
+
+    # ------------------------------------------------------------------
+    # 主循环
+    # ------------------------------------------------------------------
 
     async def run(self):
         """主状态机循环。"""
@@ -45,49 +57,81 @@ class MissionFSM:
         await self.interface.connect_and_setup()
         await self.interface.arm_and_offboard()
 
-        while self.state_index < len(self.mission_queue):
-            state = self.mission_queue[self.state_index]
-            self.current_state = state
+        while self._stack:
+            state = self._stack[-1]  # 栈顶 = 当前执行
 
-            # ---- 全局健康检查 ----
-            if not await self.interface.global_guard_check():
-                await self._handle_unhealthy("进入状态前全局守卫失败")
-                break
+            # ---- 首次进入 ----
+            if not state._entered:
+                prev_name = self._stack[-2].name \
+                    if len(self._stack) >= 2 and self._stack[-2]._entered \
+                    else "start"
+                get_logger().log_state_transition(prev_name, state.name)
 
-            # ---- 进入状态 ----
-            prev_state = self.current_state.name if self.current_state else "start"
-            get_logger().log_state_transition(prev_state, state.name)
-            await state.enter(self.interface)
-
-            # ---- 执行循环 ----
-            while True:
+                # 进入前全局健康检查
                 if not await self.interface.global_guard_check():
-                    await self._handle_unhealthy("状态执行中健康检查失败")
+                    await self._handle_unhealthy(
+                        f"进入 {state.name} 前全局守卫失败")
                     return
 
-                try:
-                    done, _ = await state.execute(self.interface)
-                except Exception as e:
-                    state.error = str(e)
-                    await self._handle_state_error(state, e)
-                    break
+                await state.enter(self.interface)
 
-                if done:
-                    break
-                await asyncio.sleep(1.0 / FSM_LOOP_HZ)
+            # ---- 每周期全局健康检查 ----
+            if not await self.interface.global_guard_check():
+                await self._handle_unhealthy(
+                    f"{state.name} 执行中健康检查失败")
+                return
 
-            # ---- 退出状态 ----
-            await state.exit(self.interface)
+            # ---- 执行 ----
+            try:
+                result = await state.execute(self.interface)
+            except Exception as e:
+                state.error = str(e)
+                await self._handle_state_error(state, e)
+                return
 
-            # ---- 超时处理 ----
-            if state.is_timed_out() and not state.is_completed:
-                print(f"[警告] {state.name} 超时 ({state.timeout_s}秒)，"
-                      f"跳过")
+            # ---- 错误 ----
+            if result.error:
+                await self._handle_state_error(
+                    state, RuntimeError(result.error))
+                return
+
+            # ---- 抢占：挂起当前，压入新状态 ----
+            if result.interrupt is not None:
+                if len(self._stack) >= MAX_STACK_DEPTH:
+                    print(f"[警告] 状态栈已达最大深度 {MAX_STACK_DEPTH}，"
+                          f"拒绝抢占 {state.name} → {result.interrupt.name}")
+                    get_logger().log_message(
+                        "warning",
+                        f"状态栈已达最大深度 {MAX_STACK_DEPTH}，"
+                        f"拒绝抢占 {state.name} → {result.interrupt.name}")
+                    continue
+
+                print(f"[状态机] {state.name} 被 {result.interrupt.name} 抢占")
                 get_logger().log_message(
-                    "warning", f"{state.name} 超时 ({state.timeout_s}秒)，跳过",
-                    "timeout")
+                    "state_machine",
+                    f"{state.name} 被 {result.interrupt.name} 抢占")
+                await state.suspend(self.interface)
+                self._stack.append(result.interrupt)
+                continue
 
-            self.state_index += 1
+            # ---- 完成：弹出，恢复下层 ----
+            if result.done:
+                # 超时处理
+                if state.is_timed_out() and not state.is_completed:
+                    print(f"[警告] {state.name} 超时 ({state.timeout_s}秒)，"
+                          f"跳过")
+                    get_logger().log_message(
+                        "warning",
+                        f"{state.name} 超时 ({state.timeout_s}秒)，跳过",
+                        "timeout")
+
+                await state.exit(self.interface)
+                self._stack.pop()
+                if self._stack:
+                    await self._stack[-1].resume(self.interface)
+                continue
+
+            await asyncio.sleep(1.0 / FSM_LOOP_HZ)
 
         # 任务结束 —— 以飞控实际状态为准，确保安全断开上锁
         await self._ensure_disarmed()
@@ -144,21 +188,31 @@ class MissionFSM:
         return False
 
     async def _handle_unhealthy(self, reason: str):
-        """紧急情况：健康检查失败时触发 RTL 自主返航降落。"""
+        """
+        紧急情况：健康检查失败时清空栈并触发 RTL。
+
+        不可恢复抢占 —— 丢弃所有挂起状态，让 PX4 自主返航。
+        """
         print(f"[紧急] 全局健康检查失败: {reason}")
         print("[紧急] 触发 RTL 返航 —— PX4 将自主爬升、返航、降落")
         get_logger().log_message(
             "emergency", f"全局健康检查失败: {reason}", "fail")
         get_logger().log_message(
             "emergency", "触发 RTL 返航 —— PX4 将自主爬升、返航、降落")
+        self._stack.clear()  # 丢弃所有挂起状态
         await self.interface.drone.action.return_to_launch()
 
     async def _handle_state_error(self, state: BaseState, error: Exception):
-        """状态执行错误的统一处理。"""
+        """
+        状态执行错误的统一处理。
+
+        不可恢复抢占 —— 丢弃所有挂起状态，触发 RTL。
+        """
         print(f"[错误] {state.name} 抛出异常: {error}")
         print("[紧急] 触发 RTL 返航")
         get_logger().log_message(
             "error", f"{state.name} 抛出异常: {error}", "fail")
         get_logger().log_message(
             "emergency", "触发 RTL 返航")
+        self._stack.clear()  # 丢弃所有挂起状态
         await self.interface.drone.action.return_to_launch()

@@ -6,7 +6,7 @@
 并将结果存储在 interface.shared 中供后续 AlignState / DropState 使用。
 """
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 from config import CRUISE_ALTITUDE_M, DROP_ZONE_DISTANCE_M, YOLO_CONFIDENCE_THRESHOLD
 
 
@@ -25,11 +25,11 @@ class SearchState(BaseState):
     async def execute(self, interface):
         if self.is_timed_out():
             self.error = "粗略搜索超时"
-            return True, None
+            return ExecutionResult(done=True)
 
         alt = await interface.get_altitude()
         if abs(alt - CRUISE_ALTITUDE_M) > 1.0:
-            return False, None  # 高度尚未稳定
+            return ExecutionResult()  # 高度尚未稳定
 
         # ---- 单次检测 ----
         try:
@@ -40,12 +40,12 @@ class SearchState(BaseState):
         except Exception as e:
             self.error = f"检测失败: {e}"
             print(f"[搜索] {self.error}")
-            return False, None
+            return ExecutionResult()
 
         if len(cylinders) < 2:
             self.error = f"仅检测到 {len(cylinders)} 个圆柱体，需要 >= 2"
             print(f"[搜索] {self.error}")
-            return False, None
+            return ExecutionResult()
 
         target1, target2 = detector.select_targets(cylinders)
 
@@ -57,7 +57,7 @@ class SearchState(BaseState):
               f"NED 偏移=({target2.ned_offset[0]:.2f}, {target2.ned_offset[1]:.2f}) 米")
 
         self.is_completed = True
-        return True, None
+        return ExecutionResult(done=True)
 
 
 async def _capture_frame_async():

@@ -4,7 +4,7 @@ from typing import Optional
 
 from mavsdk.offboard import PositionNedYaw
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 
 
 class TransitState(BaseState):
@@ -32,7 +32,7 @@ class TransitState(BaseState):
     async def execute(self, interface):
         if self.is_timed_out():
             self.error = "巡航超时"
-            return True, None
+            return ExecutionResult(done=True)
 
         alt = await interface.get_altitude()
         # 根据距离估算行进时间
@@ -41,5 +41,5 @@ class TransitState(BaseState):
 
         if self.elapsed() > est_time and abs(alt - self.target_z) < 0.5:
             self.is_completed = True
-            return True, None
-        return False, None
+            return ExecutionResult(done=True)
+        return ExecutionResult()
