@@ -34,27 +34,27 @@ FIELD_YAW_DEG = 0.0
 # ---------------------------------------------------------------------------
 # 飞行参数
 # ---------------------------------------------------------------------------
-CRUISE_ALTITUDE_M = 7.0          # 起飞后的安全巡航高度
+CRUISE_ALTITUDE_M = 5.0          # 起飞后的安全巡航高度(uncertain)
 DROP_ZONE_DISTANCE_M = 30.0      # 起飞点到投掷区的距离
 RECON_ZONE_DISTANCE_M = 55.0     # 起飞点到侦察区的距离
-DROP_ALIGN_ALTITUDE_M = 2.5      # 圆柱体上方精细对准高度
-RECON_ALTITUDE_M = 2.5           # 侦察扫描高度
+DROP_ALIGN_ALTITUDE_M = 2.0      # 圆柱体上方精细对准高度(uncertain)
+RECON_ALTITUDE_M = 3.0           # 侦察扫描高度(uncertain)
 LAND_START_ALTITUDE_M = 5.0      # 开始降落序列时的高度
-LAND_SAFE_ALTITUDE_M = 2.0       # 低于此高度时使用慢速下降
-TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度
+LAND_SAFE_ALTITUDE_M = 2.0       # 低于此高度时使用慢速下降(unused)
+TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度(uncertain)
 
 # ---------------------------------------------------------------------------
 # 控制参数
 # ---------------------------------------------------------------------------
-OFFBOARD_HEARTBEAT_HZ = 20       # offboard 设定值发送频率（须 >= 2 Hz）
-FSM_LOOP_HZ = 20                 # 状态机主循环频率
-MAX_STACK_DEPTH = 5               # 状态栈最大深度（防止无限抢占）
-TAKEOFF_COMPLETE_THRESHOLD = 0.10  # 起飞完成判据：相对误差小于此值即认为到达目标高度
-ALIGN_THRESHOLD_M = 0.05         # 视觉伺服对准阈值
-SEARCH_TIMEOUT_S = 3.0           # 目标重捕获超时
-VISUAL_SERVO_KP = 0.5            # 视觉伺服 P 控制器增益
-LAND_DESCEND_RATE_MPS = 0.3      # 降落时的正常下降速率
-DROP_ALTITUDE_M = 5.0            # 投掷阶段粗略接近高度
+OFFBOARD_HEARTBEAT_HZ = 20         # offboard 设定值发送频率（须 >= 2 Hz）
+FSM_LOOP_HZ = 20                   # 状态机主循环频率
+MAX_STACK_DEPTH = 5                # 状态栈最大深度（防止无限抢占）
+TAKEOFF_COMPLETE_THRESHOLD = 0.05  # 起飞完成判据：相对误差小于此值即认为到达目标高度
+ALIGN_THRESHOLD_M = 0.05           # 视觉伺服对准阈值
+SEARCH_TIMEOUT_S = 3.0             # 目标重捕获超时(超时改成在状态时长处理)
+VISUAL_SERVO_KP = 0.5              # 视觉伺服 P 控制器增益
+LAND_DESCEND_RATE_MPS = 0.3        # 降落时的正常下降速率
+DROP_ALTITUDE_M = 5.0              # 投掷阶段粗略接近高度
 
 # ---------------------------------------------------------------------------
 # 视觉参数
