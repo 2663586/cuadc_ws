@@ -126,6 +126,9 @@ make px4_sitl gz_x500
 
 # 若画面黑屏/空白（虚拟机等），使用 Ogre1
 PX4_GZ_SIM_RENDER_ENGINE=ogre make px4_sitl gz_x500
+
+# 使用其他地图
+PX4_GZ_WORLD=grid PX4_GZ_SIM_RENDER_ENGINE=ogre   PX4_SIM_MODEL=gz_x500 GZ_IP=127.0.0.1 ~/PX4-Autopilot/build/px4_sitl_default/bin/px4
 ```
 
 ### 终端 2 — 运行任务程序
@@ -148,6 +151,7 @@ bash scripts/run_mission_sim.sh gz_x500
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `FIELD_YAW_DEG` | 0.0 | 场地前方方向的真北方位角（°），赛前手动测量 |
 | `CRUISE_ALTITUDE_M` | 7.0 | 安全巡航高度 |
 | `DROP_ZONE_DISTANCE_M` | 30.0 | 投放区距离 |
 | `RECON_ZONE_DISTANCE_M` | 55.0 | 侦察区距离 |
@@ -160,7 +164,7 @@ bash scripts/run_mission_sim.sh gz_x500
 ## 任务流程
 
 ```
-arm → Takeoff(7m) → Hover(1s) → Transit(30m) → Hover(1s)
+arm → [PX4内建起飞至7m] → Hover(1s) → Transit(30m) → Hover(1s)
     → Search(粗检测圆筒) → Align(瓶1) → Drop(瓶1)
     → Align(瓶2) → Drop(瓶2)
     → Transit(55m) → Hover(1s) → Recon(侦察扫描)
@@ -186,7 +190,7 @@ arm → Takeoff(7m) → Hover(1s) → Transit(30m) → Hover(1s)
 ## TODO:
 
 [x] 在`main_fsm.py`中的`_handle_unhealthy`处理：怎么处理？合理性？
-[] 坐标系转换问题
+[x] 坐标系转换问题 — 已改为手动配置 FIELD_YAW_DEG + 旋转矩阵方案
 [] 心跳问题
 
 ## 许可证

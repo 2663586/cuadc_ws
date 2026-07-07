@@ -1,4 +1,8 @@
-"""起飞状态 —— 通过 offboard setpoint 爬升至目标高度。"""
+"""起飞状态 —— 通过 offboard setpoint 爬升至目标高度。
+
+注意：初始起飞（地面 → 巡航高度）已改用 PX4 内建 action.takeoff()
+在 main_fsm.run() 中完成。此状态用于任务中途需要改变飞行高度的场景。
+"""
 
 from .base_state import BaseState, ExecutionResult
 from config import TAKEOFF_COMPLETE_THRESHOLD
@@ -14,7 +18,7 @@ class TakeoffState(BaseState):
 
     async def enter(self, interface):
         await super().enter(interface)
-        # 发布目标高度 setpoint，心跳循环以 20 Hz 持续发送
+        # 在场地 NED 原点上空悬停爬升；心跳循环以 20 Hz 持续发送
         sp = interface.field_to_ned(0.0, 0.0, self.target_alt)
         interface.update_setpoint(sp)
         print(f"[起飞] 目标高度 {self.target_alt:.1f} 米")

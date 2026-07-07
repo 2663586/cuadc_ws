@@ -47,16 +47,19 @@ async def main(system_address: str = "udp://:14540", sim: bool = False):
         print("\n[中止] 手动中断 — 紧急降落")
         logger.log_message("abort", "手动中断 — 紧急降落", "fail")
         logger.log_event("abort", reason="keyboard_interrupt")
+        interface.stop_heartbeat()
         await interface.land()
     except Exception as e:
         print(f"\n[致命错误] 未处理的异常: {e}")
         logger.log_message("fatal", f"未处理的异常: {e}", "fail")
         logger.log_event("fatal", error=str(e))
+        interface.stop_heartbeat()
         try:
             await interface.land()
         except Exception:
             pass
     finally:
+        interface.stop_heartbeat()
         print("[信息] 任务结束")
         logger.log_message("info", "任务结束")
 

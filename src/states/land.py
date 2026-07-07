@@ -7,7 +7,7 @@ from logger_manager import get_logger
 
 
 class PrecisionLandState(BaseState):
-    """降落：飞回原点，触发 land，等待 PX4 着陆并自动 disarm。"""
+    """降落：飞回场地 NED 原点，触发 land，等待 PX4 着陆并自动 disarm。"""
 
     def __init__(self, timeout_s: float = 60):
         super().__init__("Land", timeout_s)

@@ -3,6 +3,8 @@
 
 从 interface.shared 读取目标（由 SearchState 填充）。
 两个子阶段：下降至约 3 米，然后视觉伺服 P 控制对准。
+
+ned_offset 使用场地 NED 坐标系（与 field_to_ned 的输入坐标系一致）。
 """
 
 import asyncio

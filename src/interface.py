@@ -5,8 +5,17 @@ PX4 通信层 —— 封装所有 MAVSDK 交互。
 - 健康看门狗（全局守卫）用于故障安全
 - Offboard 心跳循环（独立 asyncio 任务，20 Hz）
 - 遥测监控（健康状态、电量、连接状态）
-- 场地坐标到 NED 坐标的转换
+- 场地 NED 坐标到真北 NED 坐标的转换（旋转矩阵）
 - 高级指令（降落、舵机控制）
+
+坐标系约定：
+  - 代码中所有任务坐标均在"场地 NED"坐标系中定义：
+    * 原点 = HOME 点（PX4 上电/上锁时自动记录）
+    * N（场地北）= 场地前方方向
+    * E（场地东）= 场地右方方向
+    * D（下）= 垂直向下，高度用 -D（向上为正）表示
+  - field_to_ned() 通过旋转矩阵将场地 NED 转换为真北 NED，
+    旋转角 = config.FIELD_YAW_DEG（场地前方方向的真北方位角）。
 """
 
 import asyncio
@@ -17,6 +26,7 @@ from typing import Optional, Callable
 from mavsdk import System
 from mavsdk.offboard import PositionNedYaw
 from logger_manager import get_logger
+import config
 
 
 @dataclass
@@ -60,9 +70,10 @@ class PX4Interface:
 
         # 心跳状态
         self._last_setpoint = PositionNedYaw(0.0, 0.0, 0.0, 0.0)
+        self._heartbeat_running = False
 
-        # 场地航向 —— 上锁时自动检测
-        self.FIELD_YAW_DEG: float = 0.0
+        # 场地航向 —— 从 config.py 读取，赛前手动测量并配置
+        self.FIELD_YAW_DEG: float = config.FIELD_YAW_DEG
 
         # 跨状态共享数据存储（例如搜索结果）
         self.shared: dict = {}
@@ -72,7 +83,7 @@ class PX4Interface:
     # ------------------------------------------------------------------
 
     async def connect_and_setup(self):
-        """连接到 PX4，等待 GPS 锁定，检测场地朝向。"""
+        """连接到 PX4，等待 GPS 锁定。"""
         await self.drone.connect(system_address=self.system_address)
 
         # 等待连接
@@ -92,42 +103,127 @@ class PX4Interface:
         print("[信息] GPS 已锁定，家点位置已记录")
         get_logger().log_message("info", "GPS 已锁定，家点位置已记录")
 
-        # 从当前航向自动检测场地朝向
-        async for heading in self.drone.telemetry.heading():
-            self.FIELD_YAW_DEG = heading.heading_deg
-            print(f"[信息] 场地朝向自动检测: "
-                  f"FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度")
-            get_logger().log_message(
-                "info",
-                f"场地朝向自动检测: FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度")
-            break
+        # 场地朝向角使用 config.py 中手动配置的值
+        print(f"[信息] 场地朝向角: "
+              f"FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度（来自 config.py）")
+        get_logger().log_message(
+            "info",
+            f"场地朝向角: FIELD_YAW_DEG = {self.FIELD_YAW_DEG:.1f} 度（来自 config.py）")
 
         # 启动后台任务
         asyncio.create_task(self._heartbeat_loop())
 
-    async def arm_and_offboard(self):
-        """上锁并切换到 offboard 模式。"""
-        # 发送零设定值以便 offboard 有东西可锁定
-        await self.drone.offboard.set_position_ned(self._last_setpoint)
+    async def arm(self):
+        """上锁（PX4 在此刻记录 HOME 点作为 NED 原点）。"""
         await self.drone.action.arm()
-        await self.drone.offboard.start()
         self.health.is_armed = True
+        print("[信息] 已上锁，HOME 点已记录")
+        get_logger().log_message("info", "已上锁，HOME 点已记录")
+
+    async def takeoff(self, altitude_m: float, timeout_s: float = 60):
+        """
+        使用 PX4 内建起飞逻辑爬升至目标高度。
+
+        PX4 的 action.takeoff() 有专门的地面检测、爬升率 ramp-up
+        和地面效应补偿，比 offboard setpoint 爬升更安全可靠。
+
+        参数:
+            altitude_m: 目标巡航高度（米）
+            timeout_s:  起飞超时时间（秒）
+        """
+        await self.drone.action.set_takeoff_altitude(altitude_m)
+        await self.drone.action.takeoff()
+        print(f"[起飞] PX4 内建起飞，目标高度 {altitude_m:.1f} 米")
+        get_logger().log_message(
+            "takeoff", f"PX4 内建起飞，目标高度 {altitude_m:.1f} 米")
+
+        # 等待到达目标高度（直接读取遥测，不依赖缓存）
+        from config import TAKEOFF_COMPLETE_THRESHOLD
+        import time as _time
+        deadline = _time.monotonic() + timeout_s
+        while _time.monotonic() < deadline:
+            alt = await self._read_altitude_direct()
+            if alt >= altitude_m * (1 - TAKEOFF_COMPLETE_THRESHOLD):
+                print(f"[起飞] 已到达巡航高度 {alt:.1f} 米")
+                get_logger().log_message(
+                    "takeoff", f"已到达巡航高度 {alt:.1f} 米")
+                return
+            await asyncio.sleep(0.5)
+
+        # 超时
+        raise TimeoutError(
+            f"起飞超时（{timeout_s}秒），"
+            f"当前高度 {await self._read_altitude_direct():.1f} 米，"
+            f"目标 {altitude_m:.1f} 米")
+
+    async def switch_to_offboard(self):
+        """
+        切换到 offboard 模式。
+
+        必须在起飞完成、飞机已在巡航高度悬停后调用。
+        采用与旧 arm_and_offboard() 相同的已验证模式：
+        显式 set_position_ned() → 立即 offboard.start()，
+        中间不插入长延时（避免 MAVSDK 内部 setpoint 状态过期）。
+
+        PX4 端的 setpoint 连续性由心跳循环保证（自
+        connect_and_setup 起已在后台以 20Hz 持续发送）。
+
+        调用时机：arm() → takeoff() → switch_to_offboard()
+        """
+        # 读取当前 NED 位置作为初始 offboard setpoint
+        current_pos = await self.get_position_ned()
+        self.update_setpoint(current_pos)
+        print(f"[信息] 初始 offboard setpoint: "
+              f"N({current_pos.north_m:.1f}) E({current_pos.east_m:.1f}) "
+              f"D({current_pos.down_m:.1f})")
+        get_logger().log_message(
+            "info",
+            f"初始 offboard setpoint: "
+            f"N({current_pos.north_m:.1f}) E({current_pos.east_m:.1f}) "
+            f"D({current_pos.down_m:.1f})")
+
+        # 显式调用一次（MAVSDK 要求在 start() 前至少调用一次）
+        await self.drone.offboard.set_position_ned(self._last_setpoint)
+
+        # 立即 start —— 与旧 arm_and_offboard 相同的已验证时序
+        # 心跳循环已在后台持续发送，满足 PX4 的 setpoint 流要求
+        await self.drone.offboard.start()
         self.health.is_offboard = True
-        print("[信息] 已上锁，offboard 模式已启用")
-        get_logger().log_message("info", "已上锁，offboard 模式已启用")
+        print("[信息] offboard 模式已启用")
+        get_logger().log_message("info", "offboard 模式已启用")
 
     async def disarm(self):
-        """退出 offboard 模式并断开上锁。"""
+        """
+        规范关停流程：停止心跳 → 退出 offboard → 断开上锁。
+
+        心跳必须在 offboard.stop() 之前停止，否则持续发送的
+        set_position_ned 会干扰 PX4 的模式切换和 disarm 过程。
+        """
+        # 步骤1：停止心跳（阻止新的 offboard setpoint 发送）
+        self.stop_heartbeat()
+        await asyncio.sleep(0.1)  # 等待最后一个心跳周期完成
+
+        # 步骤2：退出 offboard 模式
         try:
             await self.drone.offboard.stop()
-        except Exception:
-            pass
+            print("[信息] 已退出 offboard 模式")
+            get_logger().log_message("info", "已退出 offboard 模式")
+        except Exception as e:
+            print(f"[警告] 退出 offboard 失败: {e}")
+            get_logger().log_message(
+                "warning", f"退出 offboard 失败: {e}", "fail")
+
+        # 步骤3：断开上锁
         try:
             await self.drone.action.disarm()
-        except Exception:
-            pass
-        print("[信息] 已断开上锁")
-        get_logger().log_message("info", "已断开上锁")
+            self.health.is_armed = False
+            self.health.is_offboard = False
+            print("[信息] 已断开上锁")
+            get_logger().log_message("info", "已断开上锁")
+        except Exception as e:
+            print(f"[警告] 断开上锁失败: {e}")
+            get_logger().log_message(
+                "warning", f"断开上锁失败: {e}", "fail")
 
     # ------------------------------------------------------------------
     # 健康看门狗
@@ -191,13 +287,28 @@ class PX4Interface:
 
         PX4 要求 >= 2 Hz；我们以 OFFBOARD_HEARTBEAT_HZ（约 20 Hz）
         发送以留出余量。
+
+        在 offboard 模式激活前调用 set_position_ned() 会成功发送
+        MAVLink 消息，PX4 会缓存这些 setpoint 用于 offboard 进入判定。
         """
         from config import OFFBOARD_HEARTBEAT_HZ
 
+        self._heartbeat_running = True
         interval = 1.0 / OFFBOARD_HEARTBEAT_HZ
-        while True:
-            await self.drone.offboard.set_position_ned(self._last_setpoint)
+        while self._heartbeat_running:
+            try:
+                await self.drone.offboard.set_position_ned(self._last_setpoint)
+            except Exception as e:
+                print(f"[调试] 心跳 setpoint 发送失败: {e}")
+                get_logger().log_message(
+                    "debug", f"心跳 setpoint 发送失败: {e}", "fail")
             await asyncio.sleep(interval)
+        print("[信息] 心跳循环已停止")
+        get_logger().log_message("info", "心跳循环已停止")
+
+    def stop_heartbeat(self):
+        """停止心跳循环。在 disarm 或紧急关停前调用。"""
+        self._heartbeat_running = False
 
     def update_setpoint(self, setpoint: PositionNedYaw):
         """主逻辑调用此方法以发布新的设定值。"""
@@ -224,18 +335,29 @@ class PX4Interface:
     # ------------------------------------------------------------------
 
     async def get_position_ned(self) -> PositionNedYaw:
-        """获取当前 NED 位置（单次快照）。"""
+        """
+        获取当前 NED 位置（单次快照）。
+
+        PositionBody 仅包含 x_m / y_m / z_m，不含航向。
+        yaw 使用 FIELD_YAW_DEG（场地朝向），
+        这对于初始 offboard setpoint 的位置保持场景是正确的。
+        """
         async for odom in self.drone.telemetry.odometry():
             return PositionNedYaw(
                 odom.position_body.x_m,
                 odom.position_body.y_m,
                 odom.position_body.z_m,
-                odom.position_body.heading_deg,
+                self.FIELD_YAW_DEG,
             )
 
     async def get_altitude(self) -> float:
         """获取当前相对高度（缓存值，约 2 Hz 更新）。"""
         return self.health.altitude_m
+
+    async def _read_altitude_direct(self) -> float:
+        """直接读取当前相对高度（单次快照，不依赖缓存）。"""
+        async for pos in self.drone.telemetry.position():
+            return pos.relative_altitude_m
 
     async def get_heading(self) -> float:
         """获取当前航向角度。"""
@@ -243,26 +365,39 @@ class PX4Interface:
             return heading.heading_deg
 
     # ------------------------------------------------------------------
-    # 场地坐标到 NED 坐标的转换
+    # 场地 NED 到真北 NED 的转换（旋转矩阵）
     # ------------------------------------------------------------------
 
-    def field_to_ned(self, forward_m: float, right_m: float,
-                     height_m: float) -> PositionNedYaw:
+    def field_to_ned(self, north_m: float, east_m: float,
+                     up_m: float) -> PositionNedYaw:
         """
-        将场地坐标（前 / 右 / 高）转换为 NED + 航向。
+        将场地对齐的 NED 坐标转换为真北 NED 坐标 + 航向。
 
-        N 轴固定指向真北。FIELD_YAW_DEG 记录场地前方方向
-        的真北方位角。
+        代码中所有任务坐标均在"场地 NED"坐标系中定义：
+          - 原点 = HOME 点
+          - N 轴 = 场地前方方向
+          - E 轴 = 场地右方方向
+          - 高度用 up（-D，向上为正）表示
+
+        此方法通过二维旋转矩阵将场地 NED 映射为真北 NED：
+
+            [true_N]   [cos(θ)  -sin(θ)] [north_m]
+            [true_E] = [sin(θ)   cos(θ)] [east_m]
+
+        其中 θ = FIELD_YAW_DEG（场地前方方向的真北方位角）。
 
         参数:
-            forward_m: 沿场地前方方向的距离（米）
-            right_m:   沿场地右方方向的距离（米）
-            height_m:  飞行高度（米，向上为正）
+            north_m: 场地 NED 北向分量（沿场地前方，米）
+            east_m:  场地 NED 东向分量（沿场地右方，米）
+            up_m:    飞行高度（米，向上为正）
 
         返回:
-            PositionNedYaw，包含 north、east、down 以及设为场地航向的 yaw。
+            PositionNedYaw，包含：
+              - north_m, east_m: 真北 NED 水平坐标（米）
+              - down_m: 真北 NED 垂直坐标（-up_m）
+              - yaw: 设为 FIELD_YAW_DEG，使机头朝向场地前方
         """
         theta = math.radians(self.FIELD_YAW_DEG)
-        north_m = forward_m * math.cos(theta) - right_m * math.sin(theta)
-        east_m = forward_m * math.sin(theta) + right_m * math.cos(theta)
-        return PositionNedYaw(north_m, east_m, -height_m, self.FIELD_YAW_DEG)
+        true_north = north_m * math.cos(theta) - east_m * math.sin(theta)
+        true_east = north_m * math.sin(theta) + east_m * math.cos(theta)
+        return PositionNedYaw(true_north, true_east, -up_m, self.FIELD_YAW_DEG)
