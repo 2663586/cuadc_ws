@@ -421,7 +421,7 @@ from mavsdk.offboard import VelocityNedYaw
 async def main():
     drone = System()
     await drone.connect("udp://:14540")
-    # … 等待连接、GPS、arm、进入 offboard …
+    # … 等待连接、GPS、arm、PX4内建起飞、进入 offboard …
 
     # 共享变量（asyncio 单线程，不需要锁）
     latest_cmd = VelocityNedYaw(0.0, 0.0, 0.0, 0.0)

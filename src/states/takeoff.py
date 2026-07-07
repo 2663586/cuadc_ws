@@ -1,4 +1,8 @@
-"""起飞状态 —— 通过 offboard setpoint 爬升至目标高度。"""
+"""起飞状态 —— 通过 offboard setpoint 爬升至目标高度。
+
+注意：初始起飞（地面 → 巡航高度）已改用 PX4 内建 action.takeoff()
+在 main_fsm.run() 中完成。此状态用于任务中途需要改变飞行高度的场景。
+"""
 
 from .base_state import BaseState, ExecutionResult
 from config import TAKEOFF_COMPLETE_THRESHOLD

@@ -10,10 +10,9 @@ import asyncio
 import time
 
 from interface import PX4Interface
-from config import FSM_LOOP_HZ, MAX_STACK_DEPTH
+from config import CRUISE_ALTITUDE_M, FSM_LOOP_HZ, MAX_STACK_DEPTH
 from logger_manager import get_logger
 from states.base_state import BaseState
-from states.takeoff import TakeoffState
 from states.hover import HoverState
 from states.transit import TransitState
 from states.land_in_place import LandInPlaceState
@@ -33,18 +32,19 @@ class MissionFSM:
         """
         构建任务栈。
 
+        起飞已由 PX4 内建 takeoff 在 FSM 启动前完成，
+        因此任务栈从 HoverState 开始（稳定悬停后执行后续任务）。
+
         栈顶（list[-1]）先执行，完成弹出后下一层接管。
         所以构建顺序与执行顺序相反：
             LandInPlace（栈底，最后执行）
             Transit
-            Hover
-            Takeoff（栈顶，最先执行）
+            Hover（栈顶，最先执行）
         """
         self._stack = [
             LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
             TransitState(north=5.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),
-            HoverState(hover_time=5.0),
-            TakeoffState(target_alt=5.0, timeout_s=30),                    # 栈顶 — 最先
+            HoverState(hover_time=5.0),                                    # 栈顶 — 最先
         ]
 
     # ------------------------------------------------------------------
@@ -52,10 +52,24 @@ class MissionFSM:
     # ------------------------------------------------------------------
 
     async def run(self):
-        """主状态机循环。"""
+        """
+        主状态机循环。
+
+        启动流程（方案B）：
+            连接 → Arm（锁定HOME点）→ PX4内建起飞至巡航高度
+            → 切换到Offboard模式 → 启动任务状态机
+        """
         self.build_mission()
         await self.interface.connect_and_setup()
-        await self.interface.arm_and_offboard()
+
+        # 阶段1：上锁（PX4 在此刻记录 HOME 点）
+        await self.interface.arm()
+
+        # 阶段2：PX4 内建起飞至巡航高度
+        await self.interface.takeoff(CRUISE_ALTITUDE_M)
+
+        # 阶段3：切换到 offboard 模式
+        await self.interface.switch_to_offboard()
 
         while self._stack:
             state = self._stack[-1]  # 栈顶 = 当前执行

@@ -164,7 +164,7 @@ bash scripts/run_mission_sim.sh gz_x500
 ## 任务流程
 
 ```
-arm → Takeoff(7m) → Hover(1s) → Transit(30m) → Hover(1s)
+arm → [PX4内建起飞至7m] → Hover(1s) → Transit(30m) → Hover(1s)
     → Search(粗检测圆筒) → Align(瓶1) → Drop(瓶1)
     → Align(瓶2) → Drop(瓶2)
     → Transit(55m) → Hover(1s) → Recon(侦察扫描)
