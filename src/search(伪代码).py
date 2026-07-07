@@ -1,5 +1,8 @@
 # search.py — 伪代码
 
+from states.base_state import BaseState, ExecutionResult
+from states.align import AlignState
+
 class SearchState(BaseState):
 
     def __init__(self, timeout_s=120):
@@ -34,7 +37,8 @@ class SearchState(BaseState):
     async def execute(self, interface):
         # ---- 超时 ----
         if self.is_timed_out():
-            return True, None
+            self.error = "搜索超时"
+            return ExecutionResult(done=True)
 
         # ---- 飞到当前航点（速度控制） ----
         arrived = await self._fly_to_target(interface, self._wp_index)
@@ -54,43 +58,57 @@ class SearchState(BaseState):
             # 匹配 15cm 瓶 (goal[0])
             if abs(diameter_cm - 15) <= epsilon and self.goal[0] == 0:
                 self.goal[0] = 1
-                switch_to_align(bottle=1, target=r)  # 切换至 Align（待实现）
-                return True, None
+                # 保存检测结果到共享缓存，供 AlignState 读取
+                self._save_detection(interface, bottle=1, result=r)
+                # 栈式抢占：挂起搜索 → 压入对准 → 对准完成后 resume 继续搜索
+                return ExecutionResult(interrupt=AlignState(bottle_index=1))
             # 匹配 20cm 瓶 (goal[1])
             elif abs(diameter_cm - 20) <= epsilon and self.goal[1] == 0:
                 self.goal[1] = 1
-                switch_to_align(bottle=2, target=r)  # 切换至 Align（待实现）
-                return True, None
+                self._save_detection(interface, bottle=2, result=r)
+                return ExecutionResult(interrupt=AlignState(bottle_index=2))
+
         if not arrived:
-            return False, None          # 还在路上，下一帧继续飞
+            return ExecutionResult()     # 还在路上，下一帧继续飞
+
         # ---- 无目标 → 推进到下一个航点，绕圈循环 ----
         self._wp_index = (self._wp_index + 1) % len(self._rect_waypoints)
-        return False, None
+        return ExecutionResult()
 
     # ------------------------------------------------------------------
     async def _fly_to_target(self, interface, wp_idx):
         """
-        以指定速度飞向航点 wp_idx。
+        直接发送位置指令飞向航点 wp_idx。
 
-        每帧从 _rect_waypoints 读目标坐标+速度，计算方向向量，
-        用 set_velocity_ned 驱动。到达后切回位置保持。
+        绕过 update_setpoint / 心跳，直接调用 MAVSDK offboard。
+        （后续会修改心跳代码以配合此模式，避免 set_position_ned 交替冲突）
         """
         x, y, z, speed = self._rect_waypoints[wp_idx]
         target = interface.field_to_ned(x, y, z)
 
+        # 直接发送位置 setpoint 到飞控
+        await interface.drone.offboard.set_position_ned(target)
+
+        # 到达判定
         pos = await interface.get_position_ned()
         dn = target.north_m - pos.north_m
         de = target.east_m - pos.east_m
         dist = (dn**2 + de**2) ** 0.5
+        return dist < ARRIVAL_THRESHOLD_M
 
-        if dist < ARRIVAL_THRESHOLD_M:
-            interface.update_setpoint(target)
-            return True
+    # ------------------------------------------------------------------
+    def _save_detection(self, interface, bottle: int, result: dict):
+        """
+        将检测结果写入 interface.shared，供 AlignState.enter() 读取。
 
-        vn = (dn / dist) * speed
-        ve = (de / dist) * speed
-
-        from mavsdk.offboard import VelocityNedYaw
-        await interface.drone.offboard.set_velocity_ned(
-            VelocityNedYaw(vn, ve, 0.0, target.yaw_deg))
-        return False
+        AlignState 期望 shared["drop_targets"] 是一个长度为 2 的 tuple，
+        bottle=1 对应 index 0，bottle=2 对应 index 1。
+        """
+        # 构造 AlignState 能消费的目标对象（伪代码，实际需与 AlignState 对齐）
+        target = TargetStub(
+            ned_offset=(result["circle"].cx_px, result["circle"].cy_px),
+            diameter_m=result["diameter_m"],
+        )
+        if "drop_targets" not in interface.shared:
+            interface.shared["drop_targets"] = [None, None]
+        interface.shared["drop_targets"][bottle - 1] = target
