@@ -161,8 +161,13 @@ class MissionFSM:
         正常流程中，PX4 Land 模式着陆后会自动 disarm；
         此方法检测实际状态，必要时发送 disarm 并等待确认。
         若 disarm 失败，尝试 RTL 作为最后手段。
+
+        关停顺序：停止心跳 → 退出 offboard → 断开上锁。
         """
         if not await self._is_armed():
+            # 已由 PX4 自动 disarm（如 auto-land 完成后）
+            # 仍需停止心跳和 offboard 以清理状态
+            self.interface.stop_heartbeat()
             print("[信息] 任务完成，飞控已断开上锁")
             get_logger().log_message("info", "任务完成，飞控已断开上锁")
             return
@@ -177,6 +182,7 @@ class MissionFSM:
             return
 
         # disarm 失败 —— 降级为 RTL
+        # 注意：RTL 前心跳已由 disarm() 停止
         print("[错误] disarm 失败，飞控未响应 —— 尝试 RTL 作为最后手段")
         get_logger().log_message(
             "error", "disarm 失败，飞控未响应，尝试 RTL", "fail")

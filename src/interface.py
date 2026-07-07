@@ -70,6 +70,7 @@ class PX4Interface:
 
         # 心跳状态
         self._last_setpoint = PositionNedYaw(0.0, 0.0, 0.0, 0.0)
+        self._heartbeat_running = False
 
         # 场地航向 —— 从 config.py 读取，赛前手动测量并配置
         self.FIELD_YAW_DEG: float = config.FIELD_YAW_DEG
@@ -192,17 +193,37 @@ class PX4Interface:
         get_logger().log_message("info", "offboard 模式已启用")
 
     async def disarm(self):
-        """退出 offboard 模式并断开上锁。"""
+        """
+        规范关停流程：停止心跳 → 退出 offboard → 断开上锁。
+
+        心跳必须在 offboard.stop() 之前停止，否则持续发送的
+        set_position_ned 会干扰 PX4 的模式切换和 disarm 过程。
+        """
+        # 步骤1：停止心跳（阻止新的 offboard setpoint 发送）
+        self.stop_heartbeat()
+        await asyncio.sleep(0.1)  # 等待最后一个心跳周期完成
+
+        # 步骤2：退出 offboard 模式
         try:
             await self.drone.offboard.stop()
-        except Exception:
-            pass
+            print("[信息] 已退出 offboard 模式")
+            get_logger().log_message("info", "已退出 offboard 模式")
+        except Exception as e:
+            print(f"[警告] 退出 offboard 失败: {e}")
+            get_logger().log_message(
+                "warning", f"退出 offboard 失败: {e}", "fail")
+
+        # 步骤3：断开上锁
         try:
             await self.drone.action.disarm()
-        except Exception:
-            pass
-        print("[信息] 已断开上锁")
-        get_logger().log_message("info", "已断开上锁")
+            self.health.is_armed = False
+            self.health.is_offboard = False
+            print("[信息] 已断开上锁")
+            get_logger().log_message("info", "已断开上锁")
+        except Exception as e:
+            print(f"[警告] 断开上锁失败: {e}")
+            get_logger().log_message(
+                "warning", f"断开上锁失败: {e}", "fail")
 
     # ------------------------------------------------------------------
     # 健康看门狗
@@ -272,8 +293,9 @@ class PX4Interface:
         """
         from config import OFFBOARD_HEARTBEAT_HZ
 
+        self._heartbeat_running = True
         interval = 1.0 / OFFBOARD_HEARTBEAT_HZ
-        while True:
+        while self._heartbeat_running:
             try:
                 await self.drone.offboard.set_position_ned(self._last_setpoint)
             except Exception as e:
@@ -281,6 +303,12 @@ class PX4Interface:
                 get_logger().log_message(
                     "debug", f"心跳 setpoint 发送失败: {e}", "fail")
             await asyncio.sleep(interval)
+        print("[信息] 心跳循环已停止")
+        get_logger().log_message("info", "心跳循环已停止")
+
+    def stop_heartbeat(self):
+        """停止心跳循环。在 disarm 或紧急关停前调用。"""
+        self._heartbeat_running = False
 
     def update_setpoint(self, setpoint: PositionNedYaw):
         """主逻辑调用此方法以发布新的设定值。"""
