@@ -4,6 +4,9 @@
 从 7 米高度执行单次 YOLO 检测来定位所有圆柱体，
 对其进行分类（15/20/25 厘米），选择两个投放目标，
 并将结果存储在 interface.shared 中供后续 AlignState / DropState 使用。
+
+圆柱体检测返回的 ned_offset 是在相机坐标系下的偏移量
+（图像上方=场地北、图像右方=场地东），后续与场地 NED 坐标相加。
 """
 
 from .base_state import BaseState, ExecutionResult

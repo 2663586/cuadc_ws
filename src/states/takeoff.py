@@ -14,7 +14,7 @@ class TakeoffState(BaseState):
 
     async def enter(self, interface):
         await super().enter(interface)
-        # 发布目标高度 setpoint，心跳循环以 20 Hz 持续发送
+        # 在场地 NED 原点上空悬停爬升；心跳循环以 20 Hz 持续发送
         sp = interface.field_to_ned(0.0, 0.0, self.target_alt)
         interface.update_setpoint(sp)
         print(f"[起飞] 目标高度 {self.target_alt:.1f} 米")

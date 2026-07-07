@@ -150,16 +150,16 @@ Home 点由 PX4 飞控在 **arm（上锁解锁）时刻** 自动记录当前的 
 
 **坐标系转换问题**：
 
-由于 N 轴始终指向真北，而比赛场地的"前方"（起降点 → 投放区 → 侦察区）通常不严格沿正北方向，需要一个转换层：
+由于 N 轴始终指向真北，而比赛场地的"前方"（起降点 → 投放区 → 侦察区）通常不严格沿正北方向，需要一个转换层。代码中所有任务坐标均在"场地 NED"坐标系中定义，通过旋转矩阵映射到真北 NED 后发送给 PX4。
 
 ```
-场地坐标系                     NED 坐标系（真北固定）
-    ↑ 场地前方(30m方向)           ↑ N (真北)
+场地 NED 坐标系              真北 NED 坐标系（PX4 使用）
+    ↑ N_f (场地前方)              ↑ N (真北)
     |                           /
     |                          /
-    |                         / θ = 场地偏航角
+    |                         / θ = FIELD_YAW_DEG
     |                        /
-    +--→ 场地右方              +----→ E (真东)
+    +--→ E_f (场地右方)        +----→ E (真东)
 
 场地前方 ≠ 真北，相差一个角度 θ
 ```
@@ -167,72 +167,79 @@ Home 点由 PX4 飞控在 **arm（上锁解锁）时刻** 自动记录当前的 
 ```python
 import math
 
-def field_to_ned(forward_m: float, right_m: float, height_m: float,
+def field_to_ned(north_m: float, east_m: float, up_m: float,
                  field_yaw_deg: float) -> tuple:
     """
-    将场地坐标（前方/右方/高度）转换为 NED 坐标
+    将场地对齐的 NED 坐标转换为真北 NED 坐标。
+
+    旋转矩阵：
+        [true_N]   [cos(θ)  -sin(θ)] [north_m]
+        [true_E] = [sin(θ)   cos(θ)] [east_m]
+
+    其中 θ = field_yaw_deg（场地前方方向的真北方位角）。
 
     Args:
-        forward_m: 场地前方方向的距离 (m)
-        right_m:   场地右方方向的距离 (m)
-        height_m:  飞行高度 (m)
-        field_yaw_deg: 场地正前方方向对应的真北偏航角（°）
-                       即：站在起降点，面朝投放区时的罗盘航向
+        north_m: 场地 NED 北向分量（沿场地前方，m）
+        east_m:  场地 NED 东向分量（沿场地右方，m）
+        up_m:    飞行高度（m，向上为正）
+        field_yaw_deg: 场地前方方向对应的真北方位角（°）
 
     Returns:
-        (north_m, east_m, down_m)
+        (true_north_m, true_east_m, down_m)
     """
     theta = math.radians(field_yaw_deg)
-    # 前方分量分解到北/东
-    north_m = forward_m * math.cos(theta) - right_m * math.sin(theta)
-    east_m  = forward_m * math.sin(theta) + right_m * math.cos(theta)
-    down_m  = -height_m   # NED 中 down 正值向下，高度取负
-    return north_m, east_m, down_m
+    true_north_m = north_m * math.cos(theta) - east_m * math.sin(theta)
+    true_east_m  = north_m * math.sin(theta) + east_m * math.cos(theta)
+    down_m  = -up_m   # NED 中 down 正值向下，高度取负
+    return true_north_m, true_east_m, down_m
 ```
 
 **实际使用流程**：
 
-1. 开赛前把飞行器放在起降点，机头对准场地前方
-2. Arm → PX4 自动记录 Home 点 = (0, 0, 0)
-3. 从飞控获取起降点的 GPS 航向（或读取已知的场地朝向 `field_yaw_deg`）
-4. 使用 `field_to_ned()` 将"前方 30m、高度 7m"转为 NED 坐标发给 offboard
+1. 赛前使用指南针/手机罗盘测量场地前方方向的真北方位角
+2. 将测量值填入 `config.py` 的 `FIELD_YAW_DEG` 参数
+3. 程序启动时从 config 读取，不再依赖飞行器航向自动检测
+4. Arm → PX4 自动记录 Home 点 = (0, 0, 0)
+5. 使用 `field_to_ned()` 将场地 NED 坐标转为真北 NED 坐标发给 offboard
 
 ```python
 # 示例：场地前方朝向北偏东 15°
-FIELD_YAW = 15.0  # 已知的场地朝向（真北顺时针）
+FIELD_YAW = 15.0  # 赛前手动测量并填入 config.py
 
-# 飞到投放区起点（前方30m, 高度7m）
-n, e, d = field_to_ned(30.0, 0.0, 7.0, FIELD_YAW)
-await drone.offboard.set_position_ned(PositionNedYaw(n, e, d, FIELD_YAW))
+# 飞到投放区起点（场地北 30m, 高度 7m）
+true_n, true_e, true_d = field_to_ned(30.0, 0.0, 7.0, FIELD_YAW)
+await drone.offboard.set_position_ned(PositionNedYaw(true_n, true_e, true_d, FIELD_YAW))
 ```
 
-> 如果 `field_yaw_deg` 未知，可以在起飞后通过 `telemetry.heading()` 读取飞行器当前航向，或在 arm 前手动对准场地前方并记录 `telemetry.heading()` 的初始值。
+> `FIELD_YAW_DEG` 是赛前在 `config.py` 中手动配置的参数，不再从飞行器航向自动检测。这避免了磁罗盘误差对场地朝向判断的影响。
 
 #### 补充：TransitState 与 MAVSDK 的对应关系
-`TransitState` 的参数 `(x, y, z, speed)` 直接映射到 MAVSDK offboard 控制：
+`TransitState` 的参数 `(north, east, up, speed)` 直接映射到 MAVSDK offboard 控制：
 
 | TransitState 参数 | 含义        | MAVSDK 映射                                           |
 | --------------- | --------- | --------------------------------------------------- |
-| `x`             | 目标前向距离（m） | `PositionNedYaw.north_m`                            |
-| `y`             | 目标侧向距离（m） | `PositionNedYaw.east_m`                             |
-| `z`             | 目标高度（m）   | `PositionNedYaw.down_m`（负值朝下，保持 7m 高度即 `-7.0`）      |
+| `north`         | 场地 NED 北向分量（沿场地前方，m） | `PositionNedYaw.north_m`（经旋转后）           |
+| `east`          | 场地 NED 东向分量（沿场地右方，m） | `PositionNedYaw.east_m`（经旋转后）             |
+| `up`            | 目标高度（m）   | `PositionNedYaw.down_m`（= -up_m，经旋转后）      |
 | `speed`         | 巡航速度（m/s） | 可选：`set_velocity_ned()` 或设置 PX4 参数 `MPC_XY_VEL_MAX` |
 
 **实现方式有两种**：
 
-1. **Offboard set_position_ned（推荐）**：直接发送目标位置 setpoint，飞控内部自动生成速度曲线
+1. **Offboard set_position_ned（推荐）**：先通过 `field_to_ned()` 旋转坐标，再发送 setpoint，飞控内部自动生成速度曲线
 2. **action.goto_location**：如果已知目标 GPS 坐标
 
 **示例代码**：
 
 ```python
-async def transit_to(drone, x, y, z, speed, timeout=20):
-    """TransitState 实现：以指定速度飞到 NED 目标位置"""
-    target = PositionNedYaw(float(x), float(y), -float(z), 0.0)
-    target_norm = (x**2 + y**2 + z**2) ** 0.5
+async def transit_to(drone, north, east, up, speed, timeout=20):
+    """TransitState 实现：以指定速度飞到场地 NED 目标位置"""
+    # 先通过旋转矩阵转换为真北 NED
+    true_n, true_e, true_d = field_to_ned(north, east, up, FIELD_YAW)
+    target = PositionNedYaw(true_n, true_e, true_d, 0.0)
+    target_norm = (north**2 + east**2 + up**2) ** 0.5
     duration = max(target_norm / speed, 2)  # 预估飞行时间
 
-    print(f"Transit: target=({x},{y},{z}), speed={speed}m/s, est={duration:.1f}s")
+    print(f"Transit: target=({north},{east},{up}), speed={speed}m/s, est={duration:.1f}s")
     start = asyncio.get_event_loop().time()
 
     while True:
@@ -245,7 +252,7 @@ async def transit_to(drone, x, y, z, speed, timeout=20):
 
         # 检查是否到达（可选）
         async for pos in drone.telemetry.position():
-            dist_n = abs(pos.relative_altitude_m - z)  # 简化
+            dist_n = abs(pos.relative_altitude_m - up)  # 简化
             # ... 到达判定逻辑
             break
 

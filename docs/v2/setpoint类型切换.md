@@ -115,7 +115,7 @@ PX4 内部的速度环会以当前测量速度作为初始状态，然后追踪�
 
 ```python
 # 视觉伺服完成，切回航线巡航
-sp = interface.field_to_ned(next_waypoint_x, next_waypoint_y, CRUISE_ALTITUDE_M)
+sp = interface.field_to_ned(next_waypoint_north, next_waypoint_east, CRUISE_ALTITUDE_M)
 interface.update_position_setpoint(sp)
 ```
 
@@ -137,7 +137,7 @@ class VelocitySearchState(BaseState):
             north_m_s=2.0,    # 2 m/s 向前搜索
             east_m_s=0.0,
             down_m_s=0.0,     # 保持高度
-            yaw_deg=self.FIELD_YAW_DEG,
+            yaw_deg=interface.FIELD_YAW_DEG,
         )
         interface.update_velocity_setpoint(vel)
 
@@ -145,7 +145,7 @@ class VelocitySearchState(BaseState):
         pos = await interface.get_position_ned()
         if self._out_of_bounds(pos):
             # 越界：强制切回位置模式，停在边界
-            sp = interface.field_to_ned(self._max_forward, 0, self._altitude)
+            sp = interface.field_to_ned(self._max_forward, 0.0, self._altitude)
             interface.update_position_setpoint(sp)
             return ExecutionResult(error="超出搜索边界")
 

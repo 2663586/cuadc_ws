@@ -41,10 +41,10 @@ class MissionFSM:
             Takeoff（栈顶，最先执行）
         """
         self._stack = [
-            LandInPlaceState(timeout_s=60),                         # 栈底 — 最后
-            TransitState(x=5.0, y=0.0, z=5.0, speed=5.0, timeout_s=30),
+            LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
+            TransitState(north=5.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),
             HoverState(hover_time=5.0),
-            TakeoffState(target_alt=5.0, timeout_s=30),             # 栈顶 — 最先
+            TakeoffState(target_alt=5.0, timeout_s=30),                    # 栈顶 — 最先
         ]
 
     # ------------------------------------------------------------------

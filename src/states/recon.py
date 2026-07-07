@@ -4,6 +4,8 @@
 在低空沿预计算的矩形扫描路径覆盖 8×5 米的侦察区域，
 使 FPV 视频流能够捕捉危险识别标记。
 不进行机载分类 —— 地面站人员观看视频流进行判读。
+
+航点坐标使用场地 NED 坐标系（north=场地前方, east=场地右方, up=高度）。
 """
 
 from .base_state import BaseState, ExecutionResult
