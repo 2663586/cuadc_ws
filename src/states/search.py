@@ -1,81 +1,198 @@
 """
-搜索状态 —— 在巡航高度进行圆柱体粗略检测。
+搜索状态 —— 矩形航线巡逻 + VisionPipeline 检测 + 目标匹配。
 
-从 7 米高度执行单次 YOLO 检测来定位所有圆柱体，
-对其进行分类（15/20/25 厘米），选择两个投放目标，
-并将结果存储在 interface.shared 中供后续 AlignState / DropState 使用。
+飞行模式：
+  沿矩形航线四顶点（SEARCH_WAYPOINTS）循环飞行，每帧执行
+  VisionPipeline 检测（YOLO → Canny 边缘 → HoughCircles → 针孔直径）。
+  检测到目标圆柱体后，匹配直径判断瓶型（15cm / 20cm），
+  将目标信息存入 interface.shared，通过栈式抢占切入 AlignState。
 
-圆柱体检测返回的 ned_offset 是在相机坐标系下的偏移量
-（图像上方=场地北、图像右方=场地东），后续与场地 NED 坐标相加。
+  对准完成后 resume 继续巡逻搜索。
+
+目标匹配逻辑：
+  - 15cm 瓶（goal[0]）：abs(diameter_cm - 15) ≤ EPSILON_DIAMETER_CM
+  - 20cm 瓶（goal[1]）：abs(diameter_cm - 20) ≤ EPSILON_DIAMETER_CM
+
+坐标系：
+  图像上方 = 场地北，图像右方 = 场地东
+  pixel_to_ned_offset 将圆心像素坐标转换为场地 NED 偏移量。
 """
 
+from dataclasses import dataclass
+from typing import Tuple, TYPE_CHECKING
+
 from .base_state import BaseState, ExecutionResult
-from config import CRUISE_ALTITUDE_M, DROP_ZONE_DISTANCE_M, YOLO_CONFIDENCE_THRESHOLD
+from .align import AlignState
+from config import (CRUISE_ALTITUDE_M, ARRIVAL_THRESHOLD_M,
+                    EPSILON_DIAMETER_CM, SEARCH_WAYPOINTS)
+from vision.camera import capture_frame_async
+from vision.circle_detector import DEFAULT_CAMERA_MATRIX
+from vision.pipeline import VisionPipeline
+
+if TYPE_CHECKING:
+    from interface import PX4Interface
+
+# 相机内参 — 从 CircleDetector 提取，避免硬编码不同步
+_FX = float(DEFAULT_CAMERA_MATRIX[0, 0])
+_FY = float(DEFAULT_CAMERA_MATRIX[1, 1])
+_CX = float(DEFAULT_CAMERA_MATRIX[0, 2])
+_CY = float(DEFAULT_CAMERA_MATRIX[1, 2])
+_BUCKET_HEIGHT_M = 0.30
+
+
+# ---------------------------------------------------------------------------
+# 工具：像素坐标 → 场地 NED 偏移
+# ---------------------------------------------------------------------------
+
+def pixel_to_ned_offset(cx_px: float, cy_px: float, alt_rel_m: float,
+                        fx: float = _FX, fy: float = _FY,
+                        cx: float = _CX, cy: float = _CY,
+                        bucket_h: float = _BUCKET_HEIGHT_M) -> Tuple[float, float]:
+    """下视相机像素坐标 → 场地 NED 偏移 (north_m, east_m)。
+
+    图像上方=场地北，图像右方=场地东。"""
+    z_c = alt_rel_m - bucket_h
+    if z_c <= 0:
+        return (0.0, 0.0)
+    dx = cx_px - cx          # 右 = 东
+    dy = cy_px - cy          # 下 = 南
+    east_m = dx * z_c / fx
+    north_m = -dy * z_c / fy  # 下 = 南 = -北
+    return (north_m, east_m)
+
+
+# ---------------------------------------------------------------------------
+# 数据桥接：VisionPipeline 检测结果 → AlignState
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CylinderTarget:
+    """SearchState 检测目标，AlignState 通过 .ned_offset[0/1] 消费。"""
+    ned_offset: Tuple[float, float]  # (north_m, east_m)
+    diameter_m: float
+    conf: float
+    circle_cx_px: int
+    circle_cy_px: int
 
 
 class SearchState(BaseState):
-    """粗略检测 —— 在巡航高度执行一次。"""
 
-    def __init__(self, timeout_s: float = 30):
+    def __init__(self, timeout_s: float = 120):
         super().__init__("Search", timeout_s)
+        self.goal = [0, 0]          # 0=未找到, 1=已找到
+        self._rect_waypoints = []   # 矩形航线航点列表
+        self._wp_index = 0
 
-    async def enter(self, interface):
+        # 视觉流水线: YOLO → Canny边缘 → HoughCircles → 直径
+        self.pipeline = VisionPipeline(
+            model_path="models/yolov11n_800_best_FP16.engine",
+            yolo_conf=0.5,
+            circle_conf_threshold=0.3,
+        )
+
+    # ------------------------------------------------------------------
+    async def enter(self, interface: "PX4Interface"):
         await super().enter(interface)
-        # 确保我们位于投掷区正上方
-        sp = interface.field_to_ned(DROP_ZONE_DISTANCE_M, 0.0, CRUISE_ALTITUDE_M)
-        interface.update_setpoint(sp)
 
-    async def execute(self, interface):
+        # 矩形航线四顶点 — 从 config.SEARCH_WAYPOINTS 读取
+        # 每个航点: (north_m, east_m)
+        self._rect_waypoints = list(SEARCH_WAYPOINTS)
+        self._wp_index = 0
+
+        print(f"[搜索] 矩形航线开始，{len(self._rect_waypoints)} 个航点，"
+              f"高度 {CRUISE_ALTITUDE_M:.1f}m")
+
+    # ------------------------------------------------------------------
+    async def execute(self, interface: "PX4Interface"):
+        # ---- 超时 ----
         if self.is_timed_out():
-            self.error = "粗略搜索超时"
+            self.error = "搜索超时"
             return ExecutionResult(done=True)
 
+        # ---- 飞到当前航点（速度控制） ----
+        arrived = await self._fly_to_target(interface, self._wp_index)
+
+        # ---- 执行检测 ----
         alt = await interface.get_altitude()
-        if abs(alt - CRUISE_ALTITUDE_M) > 1.0:
-            return ExecutionResult()  # 高度尚未稳定
+        frame = await capture_frame_async()
 
-        # ---- 单次检测 ----
+        # VisionPipeline: YOLO → Canny边缘 → HoughCircles → 针孔模型算直径
+        results = self.pipeline.process_frame(frame, alt_rel_m=alt)
+
+        for r in results:
+            if not r["edge_success"]:
+                continue                # 圆检测失败，跳过
+
+            diameter_cm = r["diameter_m"] * 100   # 真实直径 (cm)
+            # 匹配 15cm 瓶 (goal[0])
+            if abs(diameter_cm - 15) <= EPSILON_DIAMETER_CM and self.goal[0] == 0:
+                self.goal[0] = 1
+                # 保存检测结果到共享缓存，供 AlignState 读取
+                self._save_detection(interface, bottle=1, result=r, alt_m=alt)
+                # 栈式抢占：挂起搜索 → 压入对准 → 对准完成后 resume 继续搜索
+                return ExecutionResult(interrupt=AlignState(bottle_index=1))
+            # 匹配 20cm 瓶 (goal[1])
+            elif abs(diameter_cm - 20) <= EPSILON_DIAMETER_CM and self.goal[1] == 0:
+                self.goal[1] = 1
+                self._save_detection(interface, bottle=2, result=r, alt_m=alt)
+                return ExecutionResult(interrupt=AlignState(bottle_index=2))
+
+        if not arrived:
+            return ExecutionResult()     # 还在路上，下一帧继续飞
+
+        # ---- 无目标 → 推进到下一个航点，绕圈循环 ----
+        self._wp_index = (self._wp_index + 1) % len(self._rect_waypoints)
+        return ExecutionResult()
+
+    # ------------------------------------------------------------------
+    async def _fly_to_target(self, interface: "PX4Interface",
+                              wp_idx: int) -> bool:
+        """
+        直接发送位置指令飞向航点 wp_idx。
+
+        update_setpoint 同步心跳 + set_position_ned 立即生效，
+        两条路径发同一目标，不产生模式切换冲突。
+        """
+        north_m, east_m = self._rect_waypoints[wp_idx]
+        target = interface.field_to_ned(north_m, east_m, CRUISE_ALTITUDE_M)
+
+        # 双写：心跳目标 + 直接发送
+        interface.update_setpoint(target)
         try:
-            from vision.yolo_detector import get_detector
-            detector = get_detector()
-            frame = await _capture_frame_async()
-            cylinders = detector.detect_cylinders(frame, alt)
+            await interface.drone.offboard.set_position_ned(target)
         except Exception as e:
-            self.error = f"检测失败: {e}"
-            print(f"[搜索] {self.error}")
-            return ExecutionResult()
+            print(f"[搜索] set_position_ned 发送异常: {e}")
 
-        if len(cylinders) < 2:
-            self.error = f"仅检测到 {len(cylinders)} 个圆柱体，需要 >= 2"
-            print(f"[搜索] {self.error}")
-            return ExecutionResult()
+        # 到达判定
+        pos = await interface.get_position_ned()
+        dn = target.north_m - pos.north_m
+        de = target.east_m - pos.east_m
+        dist = (dn**2 + de**2) ** 0.5
+        return dist < ARRIVAL_THRESHOLD_M
 
-        target1, target2 = detector.select_targets(cylinders)
+    # ------------------------------------------------------------------
+    def _save_detection(self, interface: "PX4Interface", bottle: int,
+                         result: dict, alt_m: float):
+        """
+        将检测结果写入 interface.shared，供 AlignState.enter() 读取。
 
-        interface.shared["drop_targets"] = (target1, target2)
-        print(f"[搜索] 粗略检测完成:")
-        print(f"  目标 1: 类型={target1.cylinder_type}, "
-              f"NED 偏移=({target1.ned_offset[0]:.2f}, {target1.ned_offset[1]:.2f}) 米")
-        print(f"  目标 2: 类型={target2.cylinder_type}, "
-              f"NED 偏移=({target2.ned_offset[0]:.2f}, {target2.ned_offset[1]:.2f}) 米")
+        VisionPipeline 结果 → 像素转 NED → CylinderTarget →
+        shared["drop_targets"][bottle-1]
 
-        self.is_completed = True
-        return ExecutionResult(done=True)
-
-
-async def _capture_frame_async():
-    """从相机捕获单帧图像（在线程池中运行）。"""
-    import asyncio
-    import concurrent.futures
-
-    from vision.yolo_detector import _camera
-
-    if _camera is None:
-        raise RuntimeError("相机未初始化 — 请先调用 init_camera()")
-
-    loop = asyncio.get_running_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    ret, frame = await loop.run_in_executor(executor, _camera.read)
-    if not ret:
-        raise RuntimeError("从相机捕获帧失败")
-    return frame
+        AlignState 期望:
+            shared["drop_targets"] = [target1_or_None, target2_or_None]
+            target.ned_offset[0]  → 场地北偏移 (米)
+            target.ned_offset[1]  → 场地东偏移 (米)
+        """
+        circle = result["circle"]
+        ned = pixel_to_ned_offset(circle.cx_px, circle.cy_px, alt_m)
+        target = CylinderTarget(
+            ned_offset=ned,
+            diameter_m=result["diameter_m"],
+            conf=result["det"]["conf"],
+            circle_cx_px=circle.cx_px,
+            circle_cy_px=circle.cy_px,
+        )
+        if "drop_targets" not in interface.shared:
+            interface.shared["drop_targets"] = [None, None]
+        interface.shared["drop_targets"][bottle - 1] = target
