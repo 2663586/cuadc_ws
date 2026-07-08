@@ -8,6 +8,7 @@
 
 import asyncio
 import time
+from collections import deque
 
 from interface import PX4Interface
 from config import CRUISE_ALTITUDE_M, FSM_LOOP_HZ, MAX_STACK_DEPTH
@@ -28,6 +29,11 @@ class MissionFSM:
         # 注册不健康回调
         interface._on_unhealthy = self._handle_unhealthy
 
+        # ---- FSM 频率测量 ----
+        self._loop_intervals = deque(maxlen=200)  # 最近 200 个周期的间隔 (s)
+        self._last_loop_t = 0.0
+        self._loop_count = 0
+
     def build_mission(self):
         """
         构建任务栈。
@@ -43,7 +49,7 @@ class MissionFSM:
         """
         self._stack = [
             LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
-            TransitState(north=500.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),
+            TransitState(north=10.0, east=0.0, up=5.0, speed=2.0, timeout_s=30),
             ]
 
     # ------------------------------------------------------------------
@@ -71,6 +77,12 @@ class MissionFSM:
         await self.interface.switch_to_offboard()
 
         while self._stack:
+            # ---- FSM 频率测量：记录本次循环开始时间 ----
+            now = time.monotonic()
+            if self._last_loop_t > 0:
+                self._loop_intervals.append(now - self._last_loop_t)
+            self._last_loop_t = now
+
             state = self._stack[-1]  # 栈顶 = 当前执行
 
             # ---- 首次进入 ----
@@ -143,6 +155,26 @@ class MissionFSM:
                 if self._stack:
                     await self._stack[-1].resume(self.interface)
                 continue
+
+            # ---- FSM 频率统计（每 100 周期 ≈ 5 秒） ----
+            self._loop_count += 1
+            if self._loop_count % 100 == 0 and len(self._loop_intervals) > 0:
+                intervals = list(self._loop_intervals)
+                n = len(intervals)
+                mean_s = sum(intervals) / n
+                min_s = min(intervals)
+                max_s = max(intervals)
+                var = sum((x - mean_s) ** 2 for x in intervals) / n
+                std_s = var ** 0.5
+                hz_eff = 1.0 / mean_s if mean_s > 0 else 0
+                late_pct = sum(1 for x in intervals
+                               if x > 1.0 / FSM_LOOP_HZ * 1.1) / n * 100
+                print(f"[FSM 频率] {n} 周期统计: "
+                      f"均值={mean_s*1000:.1f}ms 最小={min_s*1000:.1f}ms "
+                      f"最大={max_s*1000:.1f}ms σ={std_s*1000:.1f}ms  "
+                      f"有效频率={hz_eff:.1f}Hz  "
+                      f"超时占比={late_pct:.0f}% "
+                      f"(>{(1.0 / FSM_LOOP_HZ * 1.1 * 1000):.0f}ms)")
 
             await asyncio.sleep(1.0 / FSM_LOOP_HZ)
 
@@ -219,6 +251,7 @@ class MissionFSM:
         get_logger().log_message(
             "emergency", "触发 RTL 返航 —— PX4 将自主爬升、返航、降落")
         self._stack.clear()  # 丢弃所有挂起状态
+        self.interface.stop_heartbeat()  # 停止心跳，避免 offboard setpoint 干扰 RTL
         await self.interface.drone.action.return_to_launch()
 
     async def _handle_state_error(self, state: BaseState, error: Exception):
@@ -234,4 +267,5 @@ class MissionFSM:
         get_logger().log_message(
             "emergency", "触发 RTL 返航")
         self._stack.clear()  # 丢弃所有挂起状态
+        self.interface.stop_heartbeat()  # 停止心跳，避免 offboard setpoint 干扰 RTL
         await self.interface.drone.action.return_to_launch()
