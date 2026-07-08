@@ -30,6 +30,8 @@ from typing import List, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
+from config import CIRCLE_CONF_THRESHOLD as _DEFAULT_CIRCLE_CONF
+
 from .yolo_detector import YOLODetector
 from .circle_detector import CircleDetector, CircleResult, DEFAULT_CAMERA_MATRIX, DEFAULT_DIST_COEFFS
 
@@ -69,7 +71,7 @@ class VisionPipeline:
         yolo_conf: float = 0.5,
         yolo_iou: float = 0.45,
         imgsz: int = 800,
-        circle_conf_threshold: float = 0.3,
+        circle_conf_threshold: float = _DEFAULT_CIRCLE_CONF,
         apply_undistort: bool = False,
         max_infer_fps: int = 0,
         **circle_kwargs,

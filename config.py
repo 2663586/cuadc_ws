@@ -42,7 +42,17 @@ RECON_ALTITUDE_M = 3.0           # 侦察扫描高度(uncertain)
 LAND_START_ALTITUDE_M = 5.0      # 开始降落序列时的高度
 LAND_SAFE_ALTITUDE_M = 2.0       # 低于此高度时使用慢速下降(unused)
 TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度(uncertain)
-SEARCH_SPEED_MPS = 3.0           # 矩形航线搜索巡航速度(uncertain)
+SEARCH_SPEED_MPS = 3.0              # 搜索矩形航线飞行速度(uncertain)
+ARRIVAL_REL_THRESHOLD = 0.05        # 航点到达判据：剩余距离 < 航段长度×此值即认为到达
+BOTTLE_DIAMETER_TOLERANCE_CM = 2.0  # 瓶子直径匹配容差 (cm)，用于搜索状态识别目标
+
+# 搜索矩形几何 —— 与投放区 (5m×8m) 同心，短边沿飞行前方 (N)
+#   N方向 (短边, 沿飞行前方): 3m → half = 1.5m
+#   E方向 (长边, 沿飞行右方): 6m → half = 3.0m
+SEARCH_RECT_HALF_N_M = 1.5          # 搜索矩形 N 半长（短边/2，沿飞行前方）
+SEARCH_RECT_HALF_E_M = 3.0          # 搜索矩形 E 半长（长边/2，沿飞行右方）
+SEARCH_RECT_CENTER_N_M = DROP_ZONE_DISTANCE_M  # 搜索矩形中心 N 坐标（与投放区同心）
+SEARCH_RECT_CENTER_E_M = 0.0                    # 搜索矩形中心 E 坐标
 
 # ---------------------------------------------------------------------------
 # 控制参数
@@ -62,6 +72,8 @@ DROP_ALTITUDE_M = 5.0              # 投掷阶段粗略接近高度
 # 视觉参数
 # ---------------------------------------------------------------------------
 YOLO_CONFIDENCE_THRESHOLD = 0.5  # YOLO 检测置信度阈值
+CIRCLE_CONF_THRESHOLD = 0.3       # HoughCircles 圆检测的最低 YOLO 置信度
+YOLO_MODEL_PATH = "models/yolov11n_800_best_FP16.engine"  # YOLO 模型路径
 RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
 RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
 EPSILON_DIAMETER_CM = 2.0        # 圆柱体直径匹配容差（15±2cm, 20±2cm）
