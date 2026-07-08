@@ -1,7 +1,17 @@
 # search.py — 伪代码
 
+import math
+
 from states.base_state import BaseState, ExecutionResult
 from states.align import AlignState
+from config import (
+    CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS,
+    ARRIVAL_REL_THRESHOLD, BOTTLE_DIAMETER_TOLERANCE_CM,
+    YOLO_CONFIDENCE_THRESHOLD, CIRCLE_CONF_THRESHOLD,
+    YOLO_MODEL_PATH,
+    SEARCH_RECT_HALF_N_M, SEARCH_RECT_HALF_E_M,
+    SEARCH_RECT_CENTER_N_M, SEARCH_RECT_CENTER_E_M,
+)
 
 class SearchState(BaseState):
 
@@ -14,24 +24,41 @@ class SearchState(BaseState):
         # 视觉流水线: YOLO → Canny边缘 → HoughCircles → 直径
         from vision.pipeline import VisionPipeline
         self.pipeline = VisionPipeline(
-            model_path="models/yolov11n_800_best_FP16.engine",
-            yolo_conf=0.5,
-            circle_conf_threshold=0.3,
+            model_path=YOLO_MODEL_PATH,
+            yolo_conf=YOLO_CONFIDENCE_THRESHOLD,
+            circle_conf_threshold=CIRCLE_CONF_THRESHOLD,
         )
 
     # ------------------------------------------------------------------
     async def enter(self, interface):
         await super().enter(interface)
 
-        # 矩形航线四顶点（坐标 + 速度，均已预先给定）
+        # 矩形航线四顶点 —— 与投放区 (5×8) 同心的 3×6 矩形
+        # 短边 (N, 3m) 沿飞行前方，长边 (E, 6m) 沿飞行右方
+        # 顺时针遍历：SW → NW → NE → SE
+        cN = SEARCH_RECT_CENTER_N_M
+        cE = SEARCH_RECT_CENTER_E_M
+        hN = SEARCH_RECT_HALF_N_M  # 1.5
+        hE = SEARCH_RECT_HALF_E_M  # 3.0
+
         # 每个航点: (x, y, z, speed_mps)
         self._rect_waypoints = [
-            (P1_x, P1_y, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),
-            (P2_x, P2_y, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),
-            (P3_x, P3_y, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),
-            (P4_x, P4_y, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),
+            (cN - hN, cE - hE, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),  # SW
+            (cN + hN, cE - hE, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),  # NW
+            (cN + hN, cE + hE, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),  # NE
+            (cN - hN, cE + hE, CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS),  # SE
         ]
         self._wp_index = 0
+
+        # 预计算每段航段长度（用于到达判据中的相对误差）
+        n = len(self._rect_waypoints)
+        self._segment_lengths = []
+        for i in range(n):
+            curr = self._rect_waypoints[i]
+            nxt = self._rect_waypoints[(i + 1) % n]
+            self._segment_lengths.append(
+                math.hypot(nxt[0] - curr[0], nxt[1] - curr[1])
+            )
 
     # ------------------------------------------------------------------
     async def execute(self, interface):
@@ -45,7 +72,7 @@ class SearchState(BaseState):
 
         # ---- 执行检测 ----
         alt = await interface.get_altitude()
-        frame = await _capture_frame()
+        frame = await _capture_frame_async()
 
         # VisionPipeline: YOLO → Canny边缘 → HoughCircles → 针孔模型算直径
         results = self.pipeline.process_frame(frame, alt_rel_m=alt)
@@ -56,14 +83,14 @@ class SearchState(BaseState):
 
             diameter_cm = r["diameter_m"] * 100   # 真实直径 (cm)
             # 匹配 15cm 瓶 (goal[0])
-            if abs(diameter_cm - 15) <= epsilon and self.goal[0] == 0:
+            if abs(diameter_cm - 15) <= BOTTLE_DIAMETER_TOLERANCE_CM and self.goal[0] == 0:
                 self.goal[0] = 1
                 # 保存检测结果到共享缓存，供 AlignState 读取
                 self._save_detection(interface, bottle=1, result=r)
                 # 栈式抢占：挂起搜索 → 压入对准 → 对准完成后 resume 继续搜索
                 return ExecutionResult(interrupt=AlignState(bottle_index=1))
             # 匹配 20cm 瓶 (goal[1])
-            elif abs(diameter_cm - 20) <= epsilon and self.goal[1] == 0:
+            elif abs(diameter_cm - 20) <= BOTTLE_DIAMETER_TOLERANCE_CM and self.goal[1] == 0:
                 self.goal[1] = 1
                 self._save_detection(interface, bottle=2, result=r)
                 return ExecutionResult(interrupt=AlignState(bottle_index=2))
@@ -78,23 +105,30 @@ class SearchState(BaseState):
     # ------------------------------------------------------------------
     async def _fly_to_target(self, interface, wp_idx):
         """
-        直接发送位置指令飞向航点 wp_idx。
+        通过心跳机制飞向航点 wp_idx。
 
-        绕过 update_setpoint / 心跳，直接调用 MAVSDK offboard。
-        （后续会修改心跳代码以配合此模式，避免 set_position_ned 交替冲突）
+        计算 NED 目标后调用 interface.update_setpoint() 更新共享
+        setpoint，由后台心跳以固定频率发送至飞控。与所有其他状态
+        使用相同的 setpoint 通道，无冲突。
+
+        到达判据使用相对误差：
+            剩余距离 < 航段长度 × ARRIVAL_REL_THRESHOLD
+        即已飞过约 95% 航段即认为到达，避免绝对阈值在不同航段长度下
+        过松或过紧的问题。
         """
         x, y, z, speed = self._rect_waypoints[wp_idx]
         target = interface.field_to_ned(x, y, z)
 
-        # 直接发送位置 setpoint 到飞控
-        await interface.drone.offboard.set_position_ned(target)
+        # 更新共享 setpoint，由心跳循环以 OFFBOARD_HEARTBEAT_HZ 频率发送
+        interface.update_setpoint(target)
 
-        # 到达判定
+        # 到达判定 —— 相对误差
         pos = await interface.get_position_ned()
         dn = target.north_m - pos.north_m
         de = target.east_m - pos.east_m
-        dist = (dn**2 + de**2) ** 0.5
-        return dist < ARRIVAL_THRESHOLD_M
+        dist = math.hypot(dn, de)
+        seg_length = self._segment_lengths[wp_idx]
+        return dist < seg_length * ARRIVAL_REL_THRESHOLD
 
     # ------------------------------------------------------------------
     def _save_detection(self, interface, bottle: int, result: dict):

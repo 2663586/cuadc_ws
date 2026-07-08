@@ -43,9 +43,8 @@ class MissionFSM:
         """
         self._stack = [
             LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
-            TransitState(north=5.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),
-            HoverState(hover_time=5.0),                                    # 栈顶 — 最先
-        ]
+            TransitState(north=500.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),
+            ]
 
     # ------------------------------------------------------------------
     # 主循环
