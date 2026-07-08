@@ -62,6 +62,7 @@ FSM_LOOP_HZ = 20                   # 状态机主循环频率
 MAX_STACK_DEPTH = 5                # 状态栈最大深度（防止无限抢占）
 TAKEOFF_COMPLETE_THRESHOLD = 0.05  # 起飞完成判据：相对误差小于此值即认为到达目标高度
 ALIGN_THRESHOLD_M = 0.05           # 视觉伺服对准阈值
+ARRIVAL_THRESHOLD_M = 0.5          # 到达航点的距离判定阈值
 SEARCH_TIMEOUT_S = 3.0             # 目标重捕获超时(超时改成在状态时长处理)
 VISUAL_SERVO_KP = 0.5              # 视觉伺服 P 控制器增益
 LAND_DESCEND_RATE_MPS = 0.3        # 降落时的正常下降速率
@@ -75,6 +76,7 @@ CIRCLE_CONF_THRESHOLD = 0.3       # HoughCircles 圆检测的最低 YOLO 置信�
 YOLO_MODEL_PATH = "models/yolov11n_800_best_FP16.engine"  # YOLO 模型路径
 RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
 RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
+EPSILON_DIAMETER_CM = 2.0        # 圆柱体直径匹配容差（15±2cm, 20±2cm）
 
 # ---------------------------------------------------------------------------
 # 安全参数
