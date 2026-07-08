@@ -1,239 +1,187 @@
+#!/usr/bin/env python3
 """
-基于 YOLO 的圆柱体检测器，用于投掷区。
+YOLO 检测器模块 — Jetson Orin NX (TensorRT)
+=============================================
+封装 Ultralytics YOLO 模型加载与推理，供实时/离线视觉流水线调用。
 
-工作流程：YOLO 粗略检测 → HoughCircles 精细定位 →
-针孔模型 NED 偏移 → 圆柱体类型分类。
+用法:
+    from vision.yolo_detector import YOLODetector
+
+    detector = YOLODetector("models/yolov11n_800_best_FP16.engine")
+    dets = detector.detect(frame)  # → [{x1,y1,x2,y2,conf,cls,name}, ...]
+
+模型:
+    默认使用 TensorRT FP16 engine (imgsz=800), 检测 2 类:
+      cls=0: blue_background (蓝色背景板)
+      cls=1: bucket (桶)
+
+参考:
+    CUADC/YOLO/infer.py — 已验证的 Jetson Orin NX 推理模式
 """
 
-import cv2
+import os
 import numpy as np
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-from .object_size_calculator import ObjectSizeCalculator
+from pathlib import Path
+from typing import List, Dict, Optional
 
 
-# 共享相机句柄 —— 初始化一次，在各状态间复用。
-_camera: Optional[cv2.VideoCapture] = None
-
-
-def init_camera(source=0, width=1280, height=720):
-    """初始化全局相机句柄。"""
-    global _camera
-    _camera = cv2.VideoCapture(source)
-    _camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    _camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if not _camera.isOpened():
-        raise RuntimeError(f"无法打开相机源 {source}")
-    print(f"[视觉] 相机已打开: {source}, {width}x{height}")
-
-
-def release_camera():
-    """释放全局相机句柄。"""
-    global _camera
-    if _camera is not None:
-        _camera.release()
-        _camera = None
-
-
-@dataclass
-class Cylinder:
-    """单个圆柱体的检测结果。"""
-    bbox: Tuple[int, int, int, int]       # (x, y, w, h) 像素坐标
-    center_uv: Tuple[float, float]         # 像素坐标中的中心点
-    diameter_px: float                     # 检测到的像素直径
-    estimated_diameter_cm: float           # 估算的实际直径（厘米）
-    ned_offset: Tuple[float, float]        # NED 水平偏移（米）
-    cylinder_type: Optional[int]           # 1=15厘米, 2=20厘米, 3=25厘米, None=不确定
+# 默认模型路径 — 相对于本文件所在目录的 models/
+_DEFAULT_MODEL_NAME = "yolov11n_800_best_FP16.engine"
+_DEFAULT_MODEL_DIR = Path(__file__).resolve().parent / "models"
 
 
 class YOLODetector:
-    """YOLO + HoughCircles 圆柱体检测器，带针孔模型定位。"""
+    """YOLO 目标检测器 (TensorRT / PyTorch)"""
 
-    CYLINDER_DIAMETERS = {1: 0.15, 2: 0.20, 3: 0.25}
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        imgsz: int = 800,
+        conf: float = 0.5,
+        iou: float = 0.45,
+    ):
+        """
+        Args:
+            model_path: 模型文件路径 (.engine / .pt / .onnx).
+                        默认: src/vision/models/yolov11n_800_best_FP16.engine
+            imgsz:     模型输入尺寸 (默认 800)
+            conf:      置信度阈值 (0~1)
+            iou:       NMS IoU 阈值
+        """
+        self.imgsz = imgsz
+        self.conf = conf
+        self.iou = iou
+        self.model = None
+        self._names: Dict[int, str] = {}
 
-    def __init__(self, model_path: str, camera_matrix: np.ndarray,
-                 dist_coeffs: Optional[np.ndarray] = None,
-                 confidence_threshold: float = 0.5):
-        self.confidence_threshold = confidence_threshold
-        self.calc = ObjectSizeCalculator(camera_matrix, dist_coeffs)
+        # 解析模型路径
+        if model_path is None:
+            model_path = str(_DEFAULT_MODEL_DIR / _DEFAULT_MODEL_NAME)
+        self.model_path = self._resolve_model_path(model_path)
+        self._load()
 
-        # 延迟加载 YOLO
-        self._model_path = model_path
-        self._yolo = None
+    # ------------------------------------------------------------------
+    # 模型加载
+    # ------------------------------------------------------------------
+
+    def _resolve_model_path(self, path: str) -> str:
+        """尝试自动补全模型文件扩展名 (.engine → .pt → .onnx)"""
+        if os.path.exists(path):
+            return path
+
+        base = path
+        for ext in [".engine", ".pt", ".onnx"]:
+            # 去除已有扩展名再试
+            for old_ext in [".engine", ".pt", ".onnx"]:
+                if base.endswith(old_ext):
+                    base = base[: -len(old_ext)]
+                    break
+            candidate = base + ext
+            if os.path.exists(candidate):
+                return candidate
+
+        # 都找不到, 返回原始路径 (加载时会报错)
+        return path
+
+    def _load(self):
+        """加载模型"""
+        mp = self.model_path
+        if not os.path.exists(mp):
+            raise FileNotFoundError(
+                f"模型文件未找到: {mp}\n"
+                f"请将 TensorRT engine 放到 src/vision/models/ 目录下"
+            )
+
+        try:
+            from ultralytics import YOLO
+
+            self.model = YOLO(mp)
+            backend = "TensorRT" if mp.endswith(".engine") else "PyTorch"
+            if hasattr(self.model, "names"):
+                self._names = self.model.names
+            print(f"[YOLODetector] 模型已加载: {mp} [{backend}]")
+        except Exception as e:
+            raise RuntimeError(f"模型加载失败 ({mp}): {e}") from e
+
+    # ------------------------------------------------------------------
+    # 推理
+    # ------------------------------------------------------------------
+
+    def detect(self, frame: np.ndarray) -> List[dict]:
+        """
+        对单帧图像进行目标检测。
+
+        Args:
+            frame: BGR 图像 (numpy ndarray, H×W×3)
+
+        Returns:
+            检测结果列表, 每项为:
+                {
+                    "x1": int, "y1": int, "x2": int, "y2": int,  # 边界框 (像素坐标)
+                    "conf": float,                                  # 置信度 (0~1)
+                    "cls": int,                                     # 类别 ID
+                    "name": str,                                    # 类别名称
+                }
+            无检测时返回空列表。
+        """
+        if self.model is None:
+            return []
+
+        results = self.model(
+            frame,
+            verbose=False,
+            device=0,
+            imgsz=self.imgsz,
+            conf=self.conf,
+            iou=self.iou,
+            half=True,  # FP16
+        )
+
+        dets = []
+        for r in results:
+            boxes = r.boxes
+            if boxes is not None and len(boxes) > 0:
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    cls_id = int(box.cls[0])
+                    dets.append(
+                        {
+                            "x1": int(x1),
+                            "y1": int(y1),
+                            "x2": int(x2),
+                            "y2": int(y2),
+                            "conf": round(float(box.conf[0]), 3),
+                            "cls": cls_id,
+                            "name": self._names.get(cls_id, "?"),
+                        }
+                    )
+        return dets
+
+    # ------------------------------------------------------------------
+    # 属性
+    # ------------------------------------------------------------------
 
     @property
-    def yolo(self):
-        if self._yolo is None:
-            from ultralytics import YOLO
-            self._yolo = YOLO(self._model_path)
-        return self._yolo
+    def names(self) -> Dict[int, str]:
+        """类别名称映射 {cls_id: name}"""
+        return self._names
 
-    def detect_cylinders(self, frame: np.ndarray,
-                         flight_altitude: float) -> List[Cylinder]:
+    def get_class1_detections(
+        self, dets: List[dict], conf_threshold: Optional[float] = None
+    ) -> List[dict]:
         """
-        单帧的完整检测流水线。
+        过滤出 class=1 (bucket) 且置信度达标的检测, 按置信度降序排列。
 
-        参数:
-            frame: 来自下视摄像头的 BGR 图像。
-            flight_altitude: 离地高度（米）。
+        Args:
+            dets:          detect() 返回的检测列表
+            conf_threshold: 置信度阈值, 默认使用实例的 self.conf
 
-        返回:
-            检测到的圆柱体列表，按估算直径排序（最小的在前）。
+        Returns:
+            过滤并排序后的 bucket 检测列表
         """
-        results = []
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # 相机到圆柱体顶部的距离（圆柱体高度 = 0.30 米）
-        camera_to_cylinder_z = flight_altitude - 0.30
-        if camera_to_cylinder_z <= 0:
-            return results
-
-        yolo_results = self.yolo(frame, verbose=False)
-
-        for box in yolo_results[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            conf = float(box.conf[0])
-            if conf < self.confidence_threshold:
-                continue
-
-            # HoughCircles 感兴趣区域
-            margin = 10
-            x1c = max(x1 - margin, 0)
-            y1c = max(y1 - margin, 0)
-            x2c = min(x2 + margin, frame.shape[1])
-            y2c = min(y2 + margin, frame.shape[0])
-            roi = gray[y1c:y2c, x1c:x2c]
-
-            min_r, max_r = self._estimate_radius_range(flight_altitude)
-
-            circles = cv2.HoughCircles(
-                roi, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
-                param1=50, param2=30,
-                minRadius=min_r, maxRadius=max_r,
-            )
-
-            if circles is None:
-                continue
-
-            circles = np.uint16(np.around(circles[0]))
-            best = max(circles, key=lambda c: c[2])
-            cx_roi, cy_roi, radius = best
-            cx = cx_roi + x1c
-            cy = cy_roi + y1c
-
-            # 通过针孔模型计算实际直径
-            real_w, _ = self.calc.compute_real_size(
-                radius * 2, radius * 2, camera_to_cylinder_z
-            )
-
-            # NED 偏移
-            offset_x, offset_y = self.calc.pixel_to_ned_offset(
-                cx, cy, camera_to_cylinder_z
-            )
-
-            cyl_type = self._classify_cylinder(real_w, flight_altitude)
-
-            cyl = Cylinder(
-                bbox=(x1, y1, x2 - x1, y2 - y1),
-                center_uv=(float(cx), float(cy)),
-                diameter_px=float(radius * 2),
-                estimated_diameter_cm=real_w * 100,
-                ned_offset=(offset_x, offset_y),
-                cylinder_type=cyl_type,
-            )
-            results.append(cyl)
-
-        results.sort(key=lambda c: c.estimated_diameter_cm)
-        return results
-
-    def select_targets(self, cylinders: List[Cylinder]
-                       ) -> Tuple[Cylinder, Cylinder]:
-        """
-        从检测到的圆柱体中选择两个投放目标。
-        优先选择类型 1（15 厘米，500 分），然后类型 2（20 厘米，300 分）。
-        """
-        type1 = [c for c in cylinders if c.cylinder_type == 1]
-        type2 = [c for c in cylinders if c.cylinder_type == 2]
-        type3 = [c for c in cylinders if c.cylinder_type == 3]
-
-        if type1:
-            first = type1[0]
-            second = type2[0] if type2 else (type3[0] if type3 else type1[0])
-        elif type2:
-            first = type2[0]
-            second = type3[0] if type3 else type2[0]
-        else:
-            first = type3[0] if type3 else cylinders[0]
-            second = cylinders[1] if len(cylinders) > 1 else first
-
-        return first, second
-
-    # ------------------------------------------------------------------
-    # 辅助方法
-    # ------------------------------------------------------------------
-
-    def _estimate_radius_range(self, altitude: float) -> Tuple[int, int]:
-        """根据高度估算 HoughCircles 的像素半径范围。"""
-        # 15 厘米圆柱体: r_px = (0.15 * fx) / (2 * altitude)
-        min_r = int((0.15 * self.calc.fx) / (2 * altitude) * 0.7)
-        # 25 厘米圆柱体
-        max_r = int((0.25 * self.calc.fx) / (2 * altitude) * 1.3)
-        return max(min_r, 3), max(max_r, 5)
-
-    def _classify_cylinder(self, estimated_diameter_m: float,
-                           altitude: float) -> Optional[int]:
-        """从估算直径分类圆柱体类型。"""
-        d_cm = estimated_diameter_m * 100
-
-        if altitude < 3.0:
-            if d_cm < 17.5:
-                return 1
-            elif d_cm < 22.5:
-                return 2
-            else:
-                return 3
-        else:
-            if d_cm < 18:
-                return 1
-            elif d_cm < 23:
-                return 2
-            elif d_cm > 22:
-                return 3
-            else:
-                return None
-
-    def cover_zone_check(self, flight_altitude: float,
-                         zone_size: Tuple[float, float]) -> bool:
-        """检查在给定高度下相机视场是否覆盖整个区域。"""
-        import math
-        h_fov = 2 * math.atan(self.calc.cx / self.calc.fx)
-        v_fov = 2 * math.atan(self.calc.cy / self.calc.fy)
-        h_coverage = 2 * flight_altitude * math.tan(h_fov)
-        v_coverage = 2 * flight_altitude * math.tan(v_fov)
-        return h_coverage >= zone_size[0] and v_coverage >= zone_size[1]
-
-
-# ------------------------------------------------------------------
-# 模块级单例，方便使用
-# ------------------------------------------------------------------
-
-_detector: Optional[YOLODetector] = None
-
-# 默认相机矩阵（占位值 —— 比赛前需标定）
-_DEFAULT_K = np.array([
-    [800.0, 0.0, 640.0],
-    [0.0, 800.0, 480.0],
-    [0.0, 0.0, 1.0],
-], dtype=np.float32)
-
-
-def get_detector(model_path: str = "models/cylinder_yolov8n.pt",
-                 camera_matrix: np.ndarray = None) -> YOLODetector:
-    """获取或创建单例检测器实例。"""
-    global _detector
-    if _detector is None:
-        if camera_matrix is None:
-            camera_matrix = _DEFAULT_K
-        _detector = YOLODetector(model_path, camera_matrix)
-    return _detector
+        threshold = conf_threshold if conf_threshold is not None else self.conf
+        bucket_dets = [
+            d for d in dets if d["cls"] == 1 and d["conf"] >= threshold
+        ]
+        bucket_dets.sort(key=lambda d: d["conf"], reverse=True)
+        return bucket_dets
