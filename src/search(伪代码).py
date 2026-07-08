@@ -2,6 +2,8 @@
 
 from states.base_state import BaseState, ExecutionResult
 from states.align import AlignState
+from config import (CRUISE_ALTITUDE_M, SEARCH_SPEED_MPS,
+                    ARRIVAL_THRESHOLD_M, EPSILON_DIAMETER_CM)
 
 class SearchState(BaseState):
 
@@ -56,14 +58,14 @@ class SearchState(BaseState):
 
             diameter_cm = r["diameter_m"] * 100   # 真实直径 (cm)
             # 匹配 15cm 瓶 (goal[0])
-            if abs(diameter_cm - 15) <= epsilon and self.goal[0] == 0:
+            if abs(diameter_cm - 15) <= EPSILON_DIAMETER_CM and self.goal[0] == 0:
                 self.goal[0] = 1
                 # 保存检测结果到共享缓存，供 AlignState 读取
                 self._save_detection(interface, bottle=1, result=r)
                 # 栈式抢占：挂起搜索 → 压入对准 → 对准完成后 resume 继续搜索
                 return ExecutionResult(interrupt=AlignState(bottle_index=1))
             # 匹配 20cm 瓶 (goal[1])
-            elif abs(diameter_cm - 20) <= epsilon and self.goal[1] == 0:
+            elif abs(diameter_cm - 20) <= EPSILON_DIAMETER_CM and self.goal[1] == 0:
                 self.goal[1] = 1
                 self._save_detection(interface, bottle=2, result=r)
                 return ExecutionResult(interrupt=AlignState(bottle_index=2))

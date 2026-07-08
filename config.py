@@ -42,6 +42,7 @@ RECON_ALTITUDE_M = 3.0           # 侦察扫描高度(uncertain)
 LAND_START_ALTITUDE_M = 5.0      # 开始降落序列时的高度
 LAND_SAFE_ALTITUDE_M = 2.0       # 低于此高度时使用慢速下降(unused)
 TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度(uncertain)
+SEARCH_SPEED_MPS = 3.0           # 矩形航线搜索巡航速度(uncertain)
 
 # ---------------------------------------------------------------------------
 # 控制参数
@@ -51,6 +52,7 @@ FSM_LOOP_HZ = 20                   # 状态机主循环频率
 MAX_STACK_DEPTH = 5                # 状态栈最大深度（防止无限抢占）
 TAKEOFF_COMPLETE_THRESHOLD = 0.05  # 起飞完成判据：相对误差小于此值即认为到达目标高度
 ALIGN_THRESHOLD_M = 0.05           # 视觉伺服对准阈值
+ARRIVAL_THRESHOLD_M = 0.5          # 到达航点的距离判定阈值
 SEARCH_TIMEOUT_S = 3.0             # 目标重捕获超时(超时改成在状态时长处理)
 VISUAL_SERVO_KP = 0.5              # 视觉伺服 P 控制器增益
 LAND_DESCEND_RATE_MPS = 0.3        # 降落时的正常下降速率
@@ -62,6 +64,7 @@ DROP_ALTITUDE_M = 5.0              # 投掷阶段粗略接近高度
 YOLO_CONFIDENCE_THRESHOLD = 0.5  # YOLO 检测置信度阈值
 RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
 RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
+EPSILON_DIAMETER_CM = 2.0        # 圆柱体直径匹配容差（15±2cm, 20±2cm）
 
 # ---------------------------------------------------------------------------
 # 安全参数
