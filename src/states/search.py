@@ -140,7 +140,11 @@ class SearchState(BaseState):
               flush=True)
 
     async def execute(self, interface: "PX4Interface"):
-        # ---- 全部投放完毕？(RollTask 投完最后一个桶后触发) ----
+        # ---- ReconState 完成后 resume，直接退出 ----
+        if self.is_completed:
+            return ExecutionResult(done=True)
+
+        # ---- 全部投放完毕？切换侦查状态 ----
         if interface.shared["goal"] == [1, 1]:
             self.is_completed = True
             print("[搜索] 所有目标已投放完毕，切换 ReconState")
