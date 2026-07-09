@@ -77,7 +77,7 @@
 | 类型 | float |
 | 默认值 | 2.5 m |
 | 推荐值 | `7.0` |
-| 说明 | 默认起飞高度（m）。应与程序侧 `CRUISE_ALTITUDE_M` 一致。`action.takeoff()` 会用此值，但本项目通过 offboard `set_position_ned` 覆盖，此参数作为兜底。 |
+| 说明 | 默认起飞高度（m）。PX4 `action.takeoff()` 的目标高度，应与程序侧 `CRUISE_ALTITUDE_M` 一致。程序在 `interface.takeoff()` 中调用。 |
 
 ### `COM_DISARM_LAND`
 

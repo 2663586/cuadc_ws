@@ -1,6 +1,6 @@
 """悬停状态 —— 在固定时长内保持位置。"""
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 
 
 class HoverState(BaseState):
@@ -13,5 +13,5 @@ class HoverState(BaseState):
     async def execute(self, interface):
         if self.elapsed() >= self.hover_time:
             self.is_completed = True
-            return True, None
-        return False, None
+            return ExecutionResult(done=True)
+        return ExecutionResult()

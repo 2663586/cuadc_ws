@@ -3,11 +3,13 @@
 
 从 interface.shared 读取目标（由 SearchState 填充）。
 两个子阶段：下降至约 3 米，然后视觉伺服 P 控制对准。
+
+ned_offset 使用场地 NED 坐标系（与 field_to_ned 的输入坐标系一致）。
 """
 
 import asyncio
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 from config import (
     DROP_ALIGN_ALTITUDE_M, DROP_ZONE_DISTANCE_M,
     ALIGN_THRESHOLD_M, SEARCH_TIMEOUT_S, VISUAL_SERVO_KP,
@@ -58,16 +60,16 @@ class AlignState(BaseState):
     async def execute(self, interface):
         if self.is_timed_out():
             self.error = "对准超时"
-            return True, None
+            return ExecutionResult(done=True)
 
         if self._target is None:
-            return True, None  # enter() 已设置错误
+            return ExecutionResult(done=True)  # enter() 已设置错误
 
         if self.phase == "descend":
             return await self._do_descend(interface)
         elif self.phase == "servo":
             return await self._do_visual_servo(interface)
-        return False, None
+        return ExecutionResult()
 
     async def _do_descend(self, interface):
         """等待高度降到约 3 米。"""
@@ -76,7 +78,7 @@ class AlignState(BaseState):
             self.phase = "servo"
             self._search_start = self.elapsed()
             print(f"[对准] 瓶子 {self.bottle_index}: 开始视觉伺服")
-        return False, None
+        return ExecutionResult()
 
     async def _do_visual_servo(self, interface):
         """视觉伺服循环 —— 检测圆柱体，计算偏移，P 控制。"""
@@ -91,7 +93,7 @@ class AlignState(BaseState):
             cylinders = detector.detect_cylinders(frame, alt)
         except Exception as e:
             print(f"[对准] 检测错误: {e}")
-            return False, None
+            return ExecutionResult()
 
         best = self._match_target(cylinders)
 
@@ -100,7 +102,7 @@ class AlignState(BaseState):
             if self.elapsed() - self._search_start > SEARCH_TIMEOUT_S:
                 print(f"[警告] 对准 瓶子 {self.bottle_index}: "
                       f"目标丢失超时，放弃")
-                return True, None
+                return ExecutionResult(done=True)
 
             # 保持位置，向最后已知位置漂移
             sp = interface.field_to_ned(
@@ -109,7 +111,7 @@ class AlignState(BaseState):
                 alt,
             )
             interface.update_setpoint(sp)
-            return False, None
+            return ExecutionResult()
 
         self._search_start = self.elapsed()  # 重置搜索计时器
         offset_x, offset_y = best.ned_offset
@@ -122,7 +124,7 @@ class AlignState(BaseState):
             interface.shared[f"bottle_{self.bottle_index}_position"] = best
             self.is_completed = True
             print(f"[对准] 瓶子 {self.bottle_index}: 已对准")
-            return True, None
+            return ExecutionResult(done=True)
 
         # P 控制位置调整
         sp = interface.field_to_ned(
@@ -131,7 +133,7 @@ class AlignState(BaseState):
             alt,
         )
         interface.update_setpoint(sp)
-        return False, None
+        return ExecutionResult()
 
     def _match_target(self, cylinders: list):
         """通过最近 NED 偏移匹配检测到的圆柱体与目标。"""

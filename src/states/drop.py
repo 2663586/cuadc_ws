@@ -2,7 +2,7 @@
 
 import asyncio
 
-from .base_state import BaseState
+from .base_state import BaseState, ExecutionResult
 
 
 class DropState(BaseState):
@@ -20,4 +20,4 @@ class DropState(BaseState):
 
         print(f"[投放] 瓶子 {self.bottle_index}: 已释放")
         self.is_completed = True
-        return True, None
+        return ExecutionResult(done=True)
