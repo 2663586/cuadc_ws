@@ -72,29 +72,10 @@ class TransitState(BaseState):
             self._target_ned.east_m - pos.east_m,
         )
 
-        # ---- 步骤1：设置 PX4 限速参数 ----
-        try:
-            self._original_vel_max = await interface.drone.param.get_param_float(
-                "MPC_XY_VEL_MAX")
-            print(f"[巡航] 原始 MPC_XY_VEL_MAX = {self._original_vel_max:.1f} m/s",
-                  flush=True)
-        except Exception as e:
-            print(f"[巡航] 读取 MPC_XY_VEL_MAX 失败: {e}，将不恢复原值", flush=True)
-            self._original_vel_max = None
+        # ---- 启动 PX4 原生位置飞行（设置限速 + 发送航点 setpoint） ----
+        self._original_vel_max = await interface.start_position_flight(
+            self._target_ned, self.speed)
 
-        try:
-            await interface.drone.param.set_param_float(
-                "MPC_XY_VEL_MAX", float(self.speed))
-            # 确认设置成功
-            confirmed = await interface.drone.param.get_param_float(
-                "MPC_XY_VEL_MAX")
-            print(f"[巡航] MPC_XY_VEL_MAX => {confirmed:.1f} m/s", flush=True)
-        except Exception as e:
-            print(f"[巡航] 设置 MPC_XY_VEL_MAX 失败: {e}", flush=True)
-            # 继续执行 —— PX4 会用默认值
-
-        # ---- 步骤2：发送目标航点（心跳将持续发送此 setpoint） ----
-        interface.update_setpoint(self._target_ned)
         print(f"[巡航] 航点 setpoint: "
               f"N({self._target_ned.north_m:.1f}) "
               f"E({self._target_ned.east_m:.1f}) "
@@ -141,12 +122,5 @@ class TransitState(BaseState):
 
     async def exit(self, interface):
         """退出时恢复原始 MPC_XY_VEL_MAX。"""
-        if self._original_vel_max is not None:
-            try:
-                await interface.drone.param.set_param_float(
-                    "MPC_XY_VEL_MAX", self._original_vel_max)
-                print(f"[巡航] 已恢复 MPC_XY_VEL_MAX = "
-                      f"{self._original_vel_max:.1f} m/s", flush=True)
-            except Exception as e:
-                print(f"[巡航] 恢复 MPC_XY_VEL_MAX 失败: {e}", flush=True)
+        await interface.restore_cruise_speed(self._original_vel_max)
         await super().exit(interface)

@@ -357,6 +357,64 @@ class PX4Interface:
         self._setpoint_type = "position"
 
     # ------------------------------------------------------------------
+    # PX4 原生位置飞行（Transit / Search 共用）
+    # ------------------------------------------------------------------
+
+    async def start_position_flight(self, target: PositionNedYaw,
+                                     speed_mps: float) -> float | None:
+        """
+        以指定速度飞向目标位置（PX4 原生位置控制）。
+
+        做的事：
+        1. 保存并设置 MPC_XY_VEL_MAX 为 speed_mps
+        2. 更新心跳 setpoint 缓存为 target
+
+        PX4 内部 Position Controller（200Hz+）自主处理加速、巡航、
+        减速全过程。心跳以 20Hz 维持 setpoint 流。
+
+        返回原始 MPC_XY_VEL_MAX 值（None 表示读取失败），
+        调用者应在飞行结束后传给 restore_cruise_speed() 恢复。
+
+        后续只需周期性地检查与目标的距离判断到达即可，
+        不需要再手动调用 set_position_ned。
+        """
+        # 保存原始限速
+        original = None
+        try:
+            original = await self.drone.param.get_param_float("MPC_XY_VEL_MAX")
+            print(f"[飞行] 原始 MPC_XY_VEL_MAX = {original:.1f} m/s", flush=True)
+        except Exception as e:
+            print(f"[飞行] 读取 MPC_XY_VEL_MAX 失败: {e}，将不恢复原值", flush=True)
+
+        # 设置巡航速度
+        try:
+            await self.drone.param.set_param_float("MPC_XY_VEL_MAX", float(speed_mps))
+            confirmed = await self.drone.param.get_param_float("MPC_XY_VEL_MAX")
+            print(f"[飞行] MPC_XY_VEL_MAX => {confirmed:.1f} m/s", flush=True)
+        except Exception as e:
+            print(f"[飞行] 设置 MPC_XY_VEL_MAX 失败: {e}", flush=True)
+
+        # 发送目标 setpoint（心跳维持）
+        self.update_setpoint(target)
+
+        return original
+
+    async def restore_cruise_speed(self, original: float | None):
+        """
+        恢复 MPC_XY_VEL_MAX 到飞行前的值。
+
+        参数 original 应为 start_position_flight 的返回值。
+        传入 None 时静默跳过。
+        """
+        if original is None:
+            return
+        try:
+            await self.drone.param.set_param_float("MPC_XY_VEL_MAX", original)
+            print(f"[飞行] 已恢复 MPC_XY_VEL_MAX = {original:.1f} m/s", flush=True)
+        except Exception as e:
+            print(f"[飞行] 恢复 MPC_XY_VEL_MAX 失败: {e}", flush=True)
+
+    # ------------------------------------------------------------------
     # 高级指令
     # ------------------------------------------------------------------
 
