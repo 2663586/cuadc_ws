@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 
 from mavsdk import System
-from mavsdk.offboard import PositionNedYaw
+from mavsdk.offboard import PositionNedYaw, VelocityNedYaw
 from logger_manager import get_logger
 import config
 
@@ -70,6 +70,8 @@ class PX4Interface:
 
         # 心跳状态
         self._last_setpoint = PositionNedYaw(0.0, 0.0, 0.0, 0.0)
+        self._last_velocity = VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
+        self._setpoint_type = "position"  # "position" | "velocity" | "position_velocity"
         self._heartbeat_running = False
 
         # 场地航向 —— 从 config.py 读取，赛前手动测量并配置
@@ -282,8 +284,13 @@ class PX4Interface:
 
     async def _heartbeat_loop(self):
         """
-        以固定频率发送设定值。如果主逻辑尚未更新设定值，
-        则重新发送上一次的值（惰性保持）。
+        以固定频率发送设定值。根据 _setpoint_type 自动选择
+        对应的 MAVSDK offboard 方法。
+
+        支持三种类型：
+          - "position":          纯位置控制 (set_position_ned)
+          - "velocity":          纯速度控制 (set_velocity_ned)
+          - "position_velocity": 位置+速度前馈 (set_position_velocity_ned)
 
         PX4 要求 >= 2 Hz；我们以 OFFBOARD_HEARTBEAT_HZ（约 20 Hz）
         发送以留出余量。
@@ -297,7 +304,15 @@ class PX4Interface:
         interval = 1.0 / OFFBOARD_HEARTBEAT_HZ
         while self._heartbeat_running:
             try:
-                await self.drone.offboard.set_position_ned(self._last_setpoint)
+                if self._setpoint_type == "position_velocity":
+                    await self.drone.offboard.set_position_velocity_ned(
+                        self._last_setpoint, self._last_velocity)
+                elif self._setpoint_type == "velocity":
+                    await self.drone.offboard.set_velocity_ned(
+                        self._last_velocity)
+                else:
+                    await self.drone.offboard.set_position_ned(
+                        self._last_setpoint)
             except Exception as e:
                 print(f"[调试] 心跳 setpoint 发送失败: {e}")
                 get_logger().log_message(
@@ -310,9 +325,94 @@ class PX4Interface:
         """停止心跳循环。在 disarm 或紧急关停前调用。"""
         self._heartbeat_running = False
 
+    # ------------------------------------------------------------------
+    # Setpoint 更新 API —— 三种类型
+    # ------------------------------------------------------------------
+
     def update_setpoint(self, setpoint: PositionNedYaw):
-        """主逻辑调用此方法以发布新的设定值。"""
+        """纯位置控制 —— 所有现有状态使用，保持向后兼容。"""
         self._last_setpoint = setpoint
+        self._setpoint_type = "position"
+
+    def update_velocity_setpoint(self, vel: VelocityNedYaw):
+        """纯速度控制 —— 视觉伺服、避障等场景。"""
+        self._last_velocity = vel
+        self._setpoint_type = "velocity"
+
+    def update_position_velocity_setpoint(self, pos: PositionNedYaw,
+                                           vel: VelocityNedYaw):
+        """位置+速度前馈 —— 搜索航线限速巡航。"""
+        self._last_setpoint = pos
+        self._last_velocity = vel
+        self._setpoint_type = "position_velocity"
+
+    def clear_velocity(self):
+        """
+        紧急清除速度前馈 —— suspend 时调用。
+
+        将 velocity 归零并切回纯位置模式，确保心跳退化为位置保持，
+        避免 suspend 窗口期内飞机因残留速度指令漂移。
+        """
+        self._last_velocity = VelocityNedYaw(0.0, 0.0, 0.0, self.FIELD_YAW_DEG)
+        self._setpoint_type = "position"
+
+    # ------------------------------------------------------------------
+    # PX4 原生位置飞行（Transit / Search 共用）
+    # ------------------------------------------------------------------
+
+    async def start_position_flight(self, target: PositionNedYaw,
+                                     speed_mps: float) -> float | None:
+        """
+        以指定速度飞向目标位置（PX4 原生位置控制）。
+
+        做的事：
+        1. 保存并设置 MPC_XY_VEL_MAX 为 speed_mps
+        2. 更新心跳 setpoint 缓存为 target
+
+        PX4 内部 Position Controller（200Hz+）自主处理加速、巡航、
+        减速全过程。心跳以 20Hz 维持 setpoint 流。
+
+        返回原始 MPC_XY_VEL_MAX 值（None 表示读取失败），
+        调用者应在飞行结束后传给 restore_cruise_speed() 恢复。
+
+        后续只需周期性地检查与目标的距离判断到达即可，
+        不需要再手动调用 set_position_ned。
+        """
+        # 保存原始限速
+        original = None
+        try:
+            original = await self.drone.param.get_param_float("MPC_XY_VEL_MAX")
+            print(f"[飞行] 原始 MPC_XY_VEL_MAX = {original:.1f} m/s", flush=True)
+        except Exception as e:
+            print(f"[飞行] 读取 MPC_XY_VEL_MAX 失败: {e}，将不恢复原值", flush=True)
+
+        # 设置巡航速度
+        try:
+            await self.drone.param.set_param_float("MPC_XY_VEL_MAX", float(speed_mps))
+            confirmed = await self.drone.param.get_param_float("MPC_XY_VEL_MAX")
+            print(f"[飞行] MPC_XY_VEL_MAX => {confirmed:.1f} m/s", flush=True)
+        except Exception as e:
+            print(f"[飞行] 设置 MPC_XY_VEL_MAX 失败: {e}", flush=True)
+
+        # 发送目标 setpoint（心跳维持）
+        self.update_setpoint(target)
+
+        return original
+
+    async def restore_cruise_speed(self, original: float | None):
+        """
+        恢复 MPC_XY_VEL_MAX 到飞行前的值。
+
+        参数 original 应为 start_position_flight 的返回值。
+        传入 None 时静默跳过。
+        """
+        if original is None:
+            return
+        try:
+            await self.drone.param.set_param_float("MPC_XY_VEL_MAX", original)
+            print(f"[飞行] 已恢复 MPC_XY_VEL_MAX = {original:.1f} m/s", flush=True)
+        except Exception as e:
+            print(f"[飞行] 恢复 MPC_XY_VEL_MAX 失败: {e}", flush=True)
 
     # ------------------------------------------------------------------
     # 高级指令
