@@ -67,6 +67,8 @@ SEARCH_TIMEOUT_S = 3.0             # 目标重捕获超时(超时改成在状态
 VISUAL_SERVO_KP = 0.5              # 视觉伺服 P 控制器增益
 LAND_DESCEND_RATE_MPS = 0.3        # 降落时的正常下降速率
 DROP_ALTITUDE_M = 5.0              # 投掷阶段粗略接近高度
+DROP_SERVO_CHANNEL = 1             # 投放舵机 AUX 通道号
+USE_SERVO = True                   # 是否启用舵机 (False 时模拟投桶，便于调试)
 
 # ---------------------------------------------------------------------------
 # 视觉参数
