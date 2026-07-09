@@ -414,6 +414,11 @@ class PX4Interface:
         except Exception as e:
             print(f"[飞行] 恢复 MPC_XY_VEL_MAX 失败: {e}", flush=True)
 
+    def update_velocity(self, velocity: VelocityNedYaw):
+        """更新速度设定值，并切换到速度模式（心跳循环持续发送）。"""
+        self._velocity_mode = True
+        self._last_velocity = velocity
+
     # ------------------------------------------------------------------
     # 高级指令
     # ------------------------------------------------------------------

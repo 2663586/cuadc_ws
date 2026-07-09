@@ -4,6 +4,7 @@ from .hover import HoverState
 from .transit import TransitState
 from .search import SearchState
 from .align import AlignState
+from .align_precise import AlignPreciseState
 from .drop import DropState
 from .recon import ReconState
 from .land import PrecisionLandState
