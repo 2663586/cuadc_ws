@@ -79,6 +79,7 @@ YOLO_MODEL_PATH = "models/yolov11n_800_best_FP16.engine"  # YOLO 模型路径
 RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
 RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
 EPSILON_DIAMETER_CM = 2.0        # 圆柱体直径匹配容差（15±2cm, 20±2cm）
+BUCKET_HEIGHT_M = 0.30            # 桶的实际高度 (米), 用于像素→NED换算
 
 # ---------------------------------------------------------------------------
 # 安全参数
