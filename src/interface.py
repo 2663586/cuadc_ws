@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Optional, Callable
 
 from mavsdk import System
-from mavsdk.offboard import PositionNedYaw
+from mavsdk.offboard import PositionNedYaw, VelocityNedYaw
 from logger_manager import get_logger
 
 
@@ -60,6 +60,8 @@ class PX4Interface:
 
         # 心跳状态
         self._last_setpoint = PositionNedYaw(0.0, 0.0, 0.0, 0.0)
+        self._velocity_mode = False                     # True=发速度, False=发位置
+        self._last_velocity = VelocityNedYaw(0.0, 0.0, 0.0, 0.0)
 
         # 场地航向 —— 上锁时自动检测
         self.FIELD_YAW_DEG: float = 0.0
@@ -186,8 +188,7 @@ class PX4Interface:
 
     async def _heartbeat_loop(self):
         """
-        以固定频率发送设定值。如果主逻辑尚未更新设定值，
-        则重新发送上一次的值（惰性保持）。
+        以固定频率发送设定值。在位置模式和速度模式之间切换。
 
         PX4 要求 >= 2 Hz；我们以 OFFBOARD_HEARTBEAT_HZ（约 20 Hz）
         发送以留出余量。
@@ -196,12 +197,21 @@ class PX4Interface:
 
         interval = 1.0 / OFFBOARD_HEARTBEAT_HZ
         while True:
-            await self.drone.offboard.set_position_ned(self._last_setpoint)
+            if self._velocity_mode:
+                await self.drone.offboard.set_velocity_ned(self._last_velocity)
+            else:
+                await self.drone.offboard.set_position_ned(self._last_setpoint)
             await asyncio.sleep(interval)
 
     def update_setpoint(self, setpoint: PositionNedYaw):
-        """主逻辑调用此方法以发布新的设定值。"""
+        """更新位置设定值（心跳循环持续发送）。"""
+        self._velocity_mode = False       # 切回位置模式
         self._last_setpoint = setpoint
+
+    def update_velocity(self, velocity: VelocityNedYaw):
+        """更新速度设定值，并切换到速度模式（心跳循环持续发送）。"""
+        self._velocity_mode = True
+        self._last_velocity = velocity
 
     # ------------------------------------------------------------------
     # 高级指令

@@ -15,11 +15,11 @@ FIELD_YAW_DEG = 0.0
 # ---------------------------------------------------------------------------
 # 飞行参数
 # ---------------------------------------------------------------------------
-CRUISE_ALTITUDE_M = 7.0          # 起飞后的安全巡航高度
+CRUISE_ALTITUDE_M = 5.0          # 起飞后的安全巡航高度
 DROP_ZONE_DISTANCE_M = 30.0      # 起飞点到投掷区的距离
 RECON_ZONE_DISTANCE_M = 55.0     # 起飞点到侦察区的距离
 DROP_ALIGN_ALTITUDE_M = 2.5      # 圆柱体上方精细对准高度
-RECON_ALTITUDE_M = 2.5           # 侦察扫描高度
+RECON_ALTITUDE_M = 5.0           # 侦察扫描高度
 LAND_START_ALTITUDE_M = 5.0      # 开始降落序列时的高度
 LAND_SAFE_ALTITUDE_M = 2.0       # 低于此高度时使用慢速下降
 TRANSIT_SPEED_MPS = 5.0          # 区域间巡航速度
