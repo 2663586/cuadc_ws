@@ -1,15 +1,19 @@
 """
 精细对准状态 —— 速度视觉伺服 + 角速度稳定检查。
 
-从 interface.shared 读取 SearchState 缓存的目标位置（粗定位），
-下降至约 2.5m 后通过 YOLO 实时检测 + 速度 P 控制进行精细对准。
+从 interface.shared 读取目标位置（粗定位），
+下降至约 2.5m 后通过 YOLO 实时检测进行精细对准。
 
-两个子阶段：
+伺服策略:
+  距离 > PID_ENGAGE_DISTANCE_M  → P 控制 (NED 偏移 → 速度)
+  距离 ≤ PID_ENGAGE_DISTANCE_M  → PID 控制 (像素差 → 速度)
+
+两个子阶段:
   descend  — 位置控制下降至 DROP_ALIGN_ALTITUDE_M
-  servo    — 速度视觉伺服 P 控制
+  servo    — 视觉伺服 (P 逼近 → PID 精调)
 
 对准完成后将结果写入 shared，返回 done=True，
-由 SearchState 统一调度下一步（投放）。
+由上游状态统一调度下一步（投放）。
 """
 
 import math
@@ -22,6 +26,7 @@ from config import (
     DROP_ALIGN_ALTITUDE_M,
     DROP_ZONE_DISTANCE_M,
 )
+from pid_controller import PIDController
 from vision.camera import capture_frame_async
 from vision.circle_detector import DEFAULT_CAMERA_MATRIX
 from vision.pipeline import VisionPipeline
@@ -54,27 +59,39 @@ class AlignPreciseState(BaseState):
     """速度视觉伺服精细对准 + 角速度稳定判断。
 
     从 shared["drop_targets"] 读取粗定位，下降至 2.5m
-    后用实时 YOLO 检测进行速度伺服。对准完成后返回 done=True，
-    由 SearchState 调度投放。
+    后用实时 YOLO 检测进行速度伺服:
+      - 距离 > PID_ENGAGE_DISTANCE_M: P 控制逼近
+      - 距离 ≤ PID_ENGAGE_DISTANCE_M: PID 像素级精调
+    对准完成后返回 done=True，由上游状态调度投放。
+
+    skip_descend: True 时跳过下降阶段，直接进入速度伺服
+                  (RollTaskState 已将无人机降至 DROP_ALIGN_ALTITUDE_M)。
     """
 
     # ---- 速度伺服参数 ----
-    KP_VEL = 2.0                    # 速度伺服 P 增益
+    KP_VEL = 2.0                    # P 控制增益 (距离→速度, 逼近阶段)
+    PID_ENGAGE_DISTANCE_M = 0.05    # 进入 PID 精调的距离阈值 (m)
     MAX_VEL = 1.0                   # 水平速度上限 (m/s)
     CYCLE_INTERVAL = 0.2            # 视觉检测节流 (s)，约 5 Hz
     ANGULAR_VEL_THRESHOLD = 0.5     # 机体角速度稳定阈值 (rad/s)
-    DISTANCE_THRESHOLD = 0.05       # 对准距离阈值 (m)
+    DISTANCE_THRESHOLD = 0.02       # 对准完成距离阈值 (m)
     ALIGN_TIMEOUT = 30.0            # 对准阶段超时 (s)，超时也视为完成
 
-    def __init__(self, bottle_index: int, timeout_s: float = 60):
+    def __init__(self, bottle_index: int, timeout_s: float = 60,
+                 skip_descend: bool = False):
         super().__init__("AlignPrecise", timeout_s)
         self.bottle_index = bottle_index
+        self._skip_descend = skip_descend
 
         # 子阶段
-        self.phase = "descend"        # descend → servo
-        self._target = None           # SearchState 缓存的 CylinderTarget
+        self.phase = "servo" if skip_descend else "descend"
+        self._target = None           # 缓存的 CylinderTarget
         self._align_start = 0.0
         self._last_detect_time = 0.0
+        self._pid_engaged = False     # True = 已切入 PID 精调模式
+
+        # PID 控制器 (像素差 → 速度指令)
+        self._pid = PIDController(kp=2.0, ki=0.0, kd=0.0, max_vel=MAX_VEL)
 
         # 视觉流水线（实时 YOLO 检测）
         self._pipeline = VisionPipeline(
@@ -100,16 +117,25 @@ class AlignPreciseState(BaseState):
 
         self._target = targets[idx]
 
-        # ---- 阶段1: 下降到精细对准高度 ----
-        sp = interface.field_to_ned(
-            DROP_ZONE_DISTANCE_M + self._target.ned_offset[0],
-            self._target.ned_offset[1],
-            DROP_ALIGN_ALTITUDE_M,
-        )
-        interface.update_setpoint(sp)
-        self.phase = "descend"
-        print(f"[精细对准] 瓶子 {self.bottle_index}: "
-              f"下降至 {DROP_ALIGN_ALTITUDE_M:.1f}m")
+        if self._skip_descend:
+            # RollTaskState 已将无人机降至 DROP_ALIGN_ALTITUDE_M
+            # 直接进入速度伺服
+            self.phase = "servo"
+            self._align_start = time.monotonic()
+            self._last_detect_time = 0.0
+            print(f"[精细对准] 瓶子 {self.bottle_index}: "
+                  f"跳过下降，直接开始速度伺服")
+        else:
+            # ---- 阶段1: 下降到精细对准高度 ----
+            sp = interface.field_to_ned(
+                DROP_ZONE_DISTANCE_M + self._target.ned_offset[0],
+                self._target.ned_offset[1],
+                DROP_ALIGN_ALTITUDE_M,
+            )
+            interface.update_setpoint(sp)
+            self.phase = "descend"
+            print(f"[精细对准] 瓶子 {self.bottle_index}: "
+                  f"下降至 {DROP_ALIGN_ALTITUDE_M:.1f}m")
 
     async def execute(self, interface):
         if self.is_timed_out():
@@ -187,7 +213,7 @@ class AlignPreciseState(BaseState):
             print(f"[精细对准] 视觉检测异常: {e}")
             return ExecutionResult()
 
-        # 提取成功检测到的圆柱体
+        # 提取成功检测到的圆柱体 (保留像素坐标供 PID 使用)
         cylinders = []
         for r in results:
             if r["edge_success"]:
@@ -197,6 +223,8 @@ class AlignPreciseState(BaseState):
                     "ned_offset": ned,
                     "distance": math.hypot(ned[0], ned[1]),
                     "diameter_m": r["diameter_m"],
+                    "cx_px": circle.cx_px,          # 圆心像素 x
+                    "cy_px": circle.cy_px,          # 圆心像素 y
                 })
 
         if not cylinders:
@@ -209,32 +237,54 @@ class AlignPreciseState(BaseState):
         best = min(cylinders, key=lambda c: c["distance"])
         dx, dy = best["ned_offset"]
         distance = best["distance"]
+        dx_px = best["cx_px"] - _CX    # 圆心→图像中心像素差 (东)
+        dy_px = best["cy_px"] - _CY    # 圆心→图像中心像素差 (下=南)
 
-        # ---- 3. 对准判据 ----
+        # ---- 3. 对准判据 (不变) ----
         if (distance < self.DISTANCE_THRESHOLD
                 and angular_vel < self.ANGULAR_VEL_THRESHOLD):
             print(f"[精细对准] OK → "
                   f"距离:{distance:.3f}m 角速度:{angular_vel:.3f}rad/s "
                   f"耗时:{elapsed:.1f}s")
-            # 保存结果到 shared，供 DropState 读取直径做 goal 跟踪
             interface.shared[f"bottle_{self.bottle_index}_position"] = best
             interface.clear_velocity()
+            self._pid.reset()
+            self._pid_engaged = False
             self.is_completed = True
             return ExecutionResult(done=True)
 
-        # ---- 4. 速度 P 控制 ----
-        v_north = dx * self.KP_VEL
-        v_east = dy * self.KP_VEL
-        speed = math.hypot(v_north, v_east)
-        if speed > self.MAX_VEL:
-            v_north *= self.MAX_VEL / speed
-            v_east *= self.MAX_VEL / speed
+        # ---- 4. 速度控制: 近距离 PID / 远距离 P ----
+        if distance <= self.PID_ENGAGE_DISTANCE_M:
+            # -------- PID 精调 (像素差 → 速度) --------
+            if not self._pid_engaged:
+                self._pid.reset()
+                self._pid_engaged = True
+                print(f"[精细对准] 距离 {distance:.2f}m ≤ "
+                      f"{self.PID_ENGAGE_DISTANCE_M}m，切入 PID 精调")
+
+            dt = now - self._last_detect_time
+            v_north, v_east = self._pid.update(dx_px, dy_px, dt)
+        else:
+            # -------- P 控制逼近 (NED 偏移 → 速度) --------
+            if self._pid_engaged:
+                self._pid_engaged = False
+                print(f"[精细对准] 距离 {distance:.2f}m > "
+                      f"{self.PID_ENGAGE_DISTANCE_M}m，切回 P 控制")
+
+            v_north = dx * self.KP_VEL
+            v_east = dy * self.KP_VEL
+            speed = math.hypot(v_north, v_east)
+            if speed > self.MAX_VEL:
+                v_north *= self.MAX_VEL / speed
+                v_east *= self.MAX_VEL / speed
 
         interface.update_velocity_setpoint(
             VelocityNedYaw(v_north, v_east, 0.0, interface.FIELD_YAW_DEG))
 
-        print(f"[精细对准] 调整中... "
+        mode = "PID" if self._pid_engaged else "P"
+        print(f"[精细对准] 调整中[{mode}] "
               f"偏移:({dx:+.3f},{dy:+.3f})m "
+              f"像素差:({dx_px:+.0f},{dy_px:+.0f})px "
               f"速度:({v_north:+.2f},{v_east:+.2f})m/s "
               f"距离:{distance:.3f}m")
         return ExecutionResult()

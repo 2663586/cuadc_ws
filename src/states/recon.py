@@ -49,11 +49,12 @@ class ReconState(BaseState):
         # 两条平行扫描线
         # Line 1: 右扫 (forward=fwd,         right: -half → +half)
         # Line 2: 回扫 (forward=fwd - gap,   right: +half → -half)
+        # 航点格式: (north=forward, east=right, up=alt) — 匹配 field_to_ned 签名
         self._waypoints = [
-            (-half, fwd,        alt),   # 0: 线1起点 (也是 transit 目标)
-            (+half, fwd,        alt),   # 1: 线1终点
-            (+half, fwd - gap,  alt),   # 2: 线2起点 (反向)
-            (-half, fwd - gap,  alt),   # 3: 线2终点
+            (fwd,        -half, alt),   # 0: 线1起点 (也是 transit 目标)
+            (fwd,        +half, alt),   # 1: 线1终点
+            (fwd - gap,  +half, alt),   # 2: 线2起点 (反向)
+            (fwd - gap,  -half, alt),   # 3: 线2终点
         ]
 
         # 重置所有状态
@@ -76,10 +77,10 @@ class ReconState(BaseState):
         ) ** 0.5
         self._transit_est = transit_dist / RECON_SPEED_MPS if RECON_SPEED_MPS > 0 else 10
 
-        print(f"[侦察] 飞向扫描起点 ({-half:.0f},{fwd:.0f}), "
+        print(f"[侦察] 飞向扫描起点 (forward={fwd:.0f}, right={-half:.0f}), "
               f"距离约 {transit_dist:.1f}m, 预计 {self._transit_est:.1f}s, "
-              f"线1: ({-half:.0f},{fwd:.0f}) -> ({half:.0f},{fwd:.0f}), "
-              f"线2: ({half:.0f},{fwd-gap:.0f}) -> ({-half:.0f},{fwd-gap:.0f})")
+              f"线1: ({fwd:.0f},{-half:.0f}) -> ({fwd:.0f},{half:.0f}), "
+              f"线2: ({fwd-gap:.0f},{half:.0f}) -> ({fwd-gap:.0f},{-half:.0f})")
 
     # ------------------------------------------------------------------
     # 航段距离
