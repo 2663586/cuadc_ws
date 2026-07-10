@@ -231,15 +231,20 @@ class PX4Interface:
     # 健康看门狗
     # ------------------------------------------------------------------
 
-    async def global_guard_check(self) -> bool:
+    async def global_guard_check(self,
+                                 allow_disarmed: bool = False) -> bool:
         """
         每个循环周期调用。返回 True 表示健康。
 
         所有遥测数据通过即时查询读取，节流至约 2 Hz
         以避免压垮 MAVSDK 的 gRPC 回调队列。
         两次读取之间返回上次缓存的结果。
+
+        allow_disarmed: 如果为 True，跳过 is_armed 检查
+                       （用于 RTL 着陆等 disarm 是正常终态的状态）。
         """
         import time as _time
+        from config import BATTERY_LOW_THRESHOLD_PCT, GPS_FIX_MIN
 
         now = _time.monotonic()
         if not hasattr(self, "_last_guard_read"):
@@ -274,7 +279,18 @@ class PX4Interface:
                 print(f"[调试] global_guard_check 读取错误: {e}")
                 get_logger().log_message(
                     "debug", f"global_guard_check 读取错误: {e}", "fail")
-            self._cached_healthy = self.health.is_healthy
+
+            if allow_disarmed:
+                self._cached_healthy = (
+                    self.health.is_connected
+                    and self.health.is_global_position_ok
+                    and self.health.is_home_position_ok
+                    and self.health.battery_pct > BATTERY_LOW_THRESHOLD_PCT
+                    and self.health.estimator_flags_ok
+                    and self.health.gps_fix_type >= GPS_FIX_MIN
+                )
+            else:
+                self._cached_healthy = self.health.is_healthy
 
         return self._cached_healthy
 
@@ -413,11 +429,6 @@ class PX4Interface:
             print(f"[飞行] 已恢复 MPC_XY_VEL_MAX = {original:.1f} m/s", flush=True)
         except Exception as e:
             print(f"[飞行] 恢复 MPC_XY_VEL_MAX 失败: {e}", flush=True)
-
-    def update_velocity(self, velocity: VelocityNedYaw):
-        """更新速度设定值，并切换到速度模式（心跳循环持续发送）。"""
-        self._velocity_mode = True
-        self._last_velocity = velocity
 
     # ------------------------------------------------------------------
     # 高级指令
