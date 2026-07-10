@@ -67,6 +67,8 @@ SEARCH_TIMEOUT_S = 3.0             # 目标重捕获超时(超时改成在状态
 VISUAL_SERVO_KP = 0.5              # 视觉伺服 P 控制器增益
 LAND_DESCEND_RATE_MPS = 0.3        # 降落时的正常下降速率
 DROP_ALTITUDE_M = 5.0              # 投掷阶段粗略接近高度
+DROP_SERVO_CHANNEL = 1             # 投放舵机 AUX 通道号
+USE_SERVO = True                   # 是否启用舵机 (False 时模拟投桶，便于调试)
 
 # ---------------------------------------------------------------------------
 # 视觉参数
@@ -77,6 +79,7 @@ YOLO_MODEL_PATH = "models/yolov11n_800_best_FP16.engine"  # YOLO 模型路径
 RECON_CONFIDENCE_THRESHOLD = 0.7 # 侦察分类置信度阈值
 RECON_SCAN_STEP_M = 1.5          # 侦察区域扫描线间距
 EPSILON_DIAMETER_CM = 2.0        # 圆柱体直径匹配容差（15±2cm, 20±2cm）
+BUCKET_HEIGHT_M = 0.30            # 桶的实际高度 (米), 用于像素→NED换算
 
 # ---------------------------------------------------------------------------
 # 安全参数

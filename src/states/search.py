@@ -2,13 +2,29 @@
 搜索状态 —— 矩形航线巡逻 + VisionPipeline 检测。
 
 飞行模式：
-  沿矩形航线四顶点循环飞行，每帧执行 VisionPipeline 检测。
-  检测到目标圆柱体后，将目标信息存入 interface.shared，
-  goal[?] None→0，通过栈式抢占切入 RollTaskState。
+  沿矩形航线四顶点循环飞行，每帧执行
+  VisionPipeline 检测（YOLO → Canny 边缘 → HoughCircles → 针孔直径）。
+  检测到目标圆柱体后，匹配直径判断瓶型（15cm / 20cm），
+  goal[?] 从 None 改为 0，通过栈式抢占切入 RollTaskState。
 
-RollTaskState 负责非矩形航线的全部流程：
-  粗对准 → 下降 → 精细对准(HSK) → 投放(HSK) → 返航(HSK) → 分流判断。
-完成后 resume 回 SearchState 继续巡逻搜索。
+  RollTaskState 读 goal 决定投哪个桶 (15cm优先)，投完后 goal[?] 0→1。
+  SearchState resume 继续巡逻搜索下一个目标。
+  goal == [1,1] 时 SearchState 切 ReconState 飞往侦查区。
+
+飞向航点：
+  使用与 TransitState 相同的 PX4 原生位置控制逻辑：
+  设置 MPC_XY_VEL_MAX，发送目标 setpoint 由心跳维持，
+  PX4 内部 Position Controller 自主飞行（200Hz+）。
+  心跳以 20Hz 发送缓存 setpoint，_fly_to_target 每周期刷新缓存，
+  不做直接 set_position_ned 调用（避免与心跳冲突）。
+
+目标匹配逻辑：
+  - 15cm 瓶（goal[0]）：abs(diameter_cm - 15) ≤ EPSILON_DIAMETER_CM
+  - 20cm 瓶（goal[1]）：abs(diameter_cm - 20) ≤ EPSILON_DIAMETER_CM
+
+坐标系：
+  图像上方 = 场地北，图像右方 = 场地东
+  pixel_to_ned_offset 将圆心像素坐标转换为场地 NED 偏移量。
 """
 
 import math
@@ -18,8 +34,8 @@ from typing import Tuple, TYPE_CHECKING
 from mavsdk.offboard import PositionNedYaw
 
 from .base_state import BaseState, ExecutionResult
-from .roll_task import RollTaskState
 from .recon import ReconState
+from .roll_task import RollTaskState
 from config import (CRUISE_ALTITUDE_M, ARRIVAL_THRESHOLD_M,
                     EPSILON_DIAMETER_CM,
                     SEARCH_SPEED_MPS,
@@ -62,12 +78,12 @@ def pixel_to_ned_offset(cx_px: float, cy_px: float, alt_rel_m: float,
 
 
 # ---------------------------------------------------------------------------
-# 数据桥接
+# 数据桥接：VisionPipeline 检测结果 → 下游状态
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CylinderTarget:
-    """SearchState 检测目标，供 RollTaskState / AlignPreciseState 通过 shared 消费。"""
+    """SearchState 检测目标，供下游状态通过 shared["drop_targets"] 消费。"""
     ned_offset: Tuple[float, float]  # (north_m, east_m)
     diameter_m: float
     conf: float
@@ -102,7 +118,8 @@ class SearchState(BaseState):
         if "goal" not in interface.shared:
             interface.shared["goal"] = [None, None]
 
-        # ---- 矩形航线四顶点 ----
+        # ---- 从 config 计算矩形航线四顶点 ----
+        # 矩形 3m(N) × 6m(E)，与投放区同心
         cn = SEARCH_RECT_CENTER_N_M
         ce = SEARCH_RECT_CENTER_E_M
         hn = SEARCH_RECT_HALF_N_M
@@ -135,19 +152,15 @@ class SearchState(BaseState):
               f"N({pos.north_m:.1f}) E({pos.east_m:.1f})")
 
     async def execute(self, interface: "PX4Interface"):
-        goal = interface.shared.get("goal", [None, None])
-
-        # ---- 两轮投放完成 → 切入侦察 ----
-        if goal == [1, 1] and not self._recon_triggered:
-            self._recon_triggered = True
-            print("[搜索] 两个目标均已投放，触发侦察")
-            return ExecutionResult(interrupt=ReconState(timeout_s=120))
-
-        # ---- 侦察已完成，任务结束 ----
-        if self._recon_triggered and goal == [1, 1]:
-            self.is_completed = True
-            print("[搜索] 侦察完成，任务结束")
+        # ---- ReconState 完成后 resume，直接退出 ----
+        if self.is_completed:
             return ExecutionResult(done=True)
+
+        # ---- RollTask 通知：全部投完 → 切侦查状态 ----
+        if interface.shared.pop("goto_recon", False):
+            self.is_completed = True
+            print("[搜索] RollTask 通知全部投完，切换 ReconState")
+            return ExecutionResult(interrupt=ReconState())
 
         # ---- 超时 ----
         if self.is_timed_out():
@@ -166,22 +179,20 @@ class SearchState(BaseState):
             if not r["edge_success"]:
                 continue
 
-            diameter_cm = r["diameter_m"] * 100
+            diameter_cm = r["diameter_m"] * 100   # 真实直径 (cm)
 
             # 匹配 15cm 瓶 — 只在尚未被发现时触发
             if (abs(diameter_cm - 15) <= EPSILON_DIAMETER_CM
-                    and goal[0] is None):
-                goal[0] = 0          # None→0: 已发现，待投
+                    and interface.shared["goal"][0] is None):
+                interface.shared["goal"][0] = 0          # None→0: 已发现，待投
                 self._save_detection(interface, bottle=1, result=r, alt_m=alt)
-                print("[搜索] 发现 15cm 目标，切入 RollTaskState")
                 return ExecutionResult(interrupt=RollTaskState())
 
             # 匹配 20cm 瓶 — 只在尚未被发现时触发
             elif (abs(diameter_cm - 20) <= EPSILON_DIAMETER_CM
-                    and goal[1] is None):
-                goal[1] = 0          # None→0: 已发现，待投
+                    and interface.shared["goal"][1] is None):
+                interface.shared["goal"][1] = 0          # None→0: 已发现，待投
                 self._save_detection(interface, bottle=2, result=r, alt_m=alt)
-                print("[搜索] 发现 20cm 目标，切入 RollTaskState")
                 return ExecutionResult(interrupt=RollTaskState())
 
         if not arrived:
@@ -220,6 +231,12 @@ class SearchState(BaseState):
 
     def _save_detection(self, interface: "PX4Interface", bottle: int,
                          result: dict, alt_m: float):
+        """
+        将检测结果写入 interface.shared，供下游状态读取。
+
+        VisionPipeline 结果 → 像素转 NED → CylinderTarget →
+        shared["drop_targets"][bottle-1]
+        """
         circle = result["circle"]
         ned = pixel_to_ned_offset(circle.cx_px, circle.cy_px, alt_m)
         target = CylinderTarget(

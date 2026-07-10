@@ -32,19 +32,20 @@ class MissionFSM:
         """
         构建任务栈。
 
-        起飞已由 PX4 内建 takeoff 在 FSM 启动前完成，
-        因此任务栈从 HoverState 开始（稳定悬停后执行后续任务）。
+        起飞已由 PX4 内建 takeoff 在 FSM 启动前完成。
 
         栈顶（list[-1]）先执行，完成弹出后下一层接管。
         所以构建顺序与执行顺序相反：
             LandInPlace（栈底，最后执行）
-            Transit
-            Hover（栈顶，最先执行）
+            Search（巡逻搜索+触发 RollTask/Recon）
+            Transit（栈顶，先飞到投放区）
         """
+        from states.search import SearchState
+
         self._stack = [
-            PrecisionLandState(timeout_s=60),                                    # 栈底 — 最后
-            SearchState(timeout_s=120),                                          # 搜索+调度
-            TransitState(north=30.0, east=0.0, up=5.0, speed=5.0, timeout_s=30), # 栈顶 — 飞往投放区
+            LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
+            SearchState(timeout_s=120),                                     # 巡逻搜索
+            TransitState(north=30.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),  # 飞往投放区
             ]
 
     # ------------------------------------------------------------------
