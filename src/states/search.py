@@ -1,36 +1,27 @@
 """
-搜索状态 —— 矩形航线巡逻 + VisionPipeline 检测 + 目标匹配。
+搜索状态 —— 矩形航线巡逻 + VisionPipeline 检测 + 任务调度。
 
 飞行模式：
-  沿矩形航线四顶点循环飞行，每帧执行
-  VisionPipeline 检测（YOLO → Canny 边缘 → HoughCircles → 针孔直径）。
-  检测到目标圆柱体后，匹配直径判断瓶型（15cm / 20cm），
-  将目标信息存入 interface.shared，通过栈式抢占切入 AlignState。
+  沿矩形航线四顶点循环飞行，每帧执行 VisionPipeline 检测。
+  检测到目标圆柱体后，将目标信息存入 interface.shared，
+  通过栈式抢占依次切入：粗对准 → 精细对准 → 投放 → 返航。
 
-  对准完成后 resume 继续巡逻搜索。
-
-飞向航点：
-  使用与 TransitState 相同的 PX4 原生位置控制逻辑：
-  设置 MPC_XY_VEL_MAX，发送目标 setpoint 由心跳维持，
-  PX4 内部 Position Controller 自主飞行（200Hz+）。
-  心跳以 20Hz 发送缓存 setpoint，_fly_to_target 每周期刷新缓存，
-  不做直接 set_position_ned 调用（避免与心跳冲突）。
-
-目标匹配逻辑：
-  - 15cm 瓶（goal[0]）：abs(diameter_cm - 15) ≤ EPSILON_DIAMETER_CM
-  - 20cm 瓶（goal[1]）：abs(diameter_cm - 20) ≤ EPSILON_DIAMETER_CM
-
-坐标系：
-  图像上方 = 场地北，图像右方 = 场地东
-  pixel_to_ned_offset 将圆心像素坐标转换为场地 NED 偏移量。
+每个子状态完成后 resume 回 SearchState，由 _next_action 决定下一步。
+两轮投放完成后自动切入侦察，侦察完成后 SearchState 退出。
 """
 
 import math
 from dataclasses import dataclass
 from typing import Tuple, TYPE_CHECKING
 
+from mavsdk.offboard import PositionNedYaw
+
 from .base_state import BaseState, ExecutionResult
 from .align import AlignState
+from .align_precise import AlignPreciseState
+from .drop import DropState
+from .post_drop_nav import PostDropNavState
+from .recon import ReconState
 from config import (CRUISE_ALTITUDE_M, ARRIVAL_THRESHOLD_M,
                     EPSILON_DIAMETER_CM,
                     SEARCH_SPEED_MPS,
@@ -43,7 +34,7 @@ from vision.pipeline import VisionPipeline
 if TYPE_CHECKING:
     from interface import PX4Interface
 
-# 相机内参 — 从 CircleDetector 提取，避免硬编码不同步
+# 相机内参
 _FX = float(DEFAULT_CAMERA_MATRIX[0, 0])
 _FY = float(DEFAULT_CAMERA_MATRIX[1, 1])
 _CX = float(DEFAULT_CAMERA_MATRIX[0, 2])
@@ -65,20 +56,20 @@ def pixel_to_ned_offset(cx_px: float, cy_px: float, alt_rel_m: float,
     z_c = alt_rel_m - bucket_h
     if z_c <= 0:
         return (0.0, 0.0)
-    dx = cx_px - cx          # 右 = 东
-    dy = cy_px - cy          # 下 = 南
+    dx = cx_px - cx
+    dy = cy_px - cy
     east_m = dx * z_c / fx
-    north_m = -dy * z_c / fy  # 下 = 南 = -北
+    north_m = -dy * z_c / fy
     return (north_m, east_m)
 
 
 # ---------------------------------------------------------------------------
-# 数据桥接：VisionPipeline 检测结果 → AlignState
+# 数据桥接
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CylinderTarget:
-    """SearchState 检测目标，AlignState 通过 .ned_offset[0/1] 消费。"""
+    """SearchState 检测目标，供 AlignState / AlignPreciseState 消费。"""
     ned_offset: Tuple[float, float]  # (north_m, east_m)
     diameter_m: float
     conf: float
@@ -90,12 +81,17 @@ class SearchState(BaseState):
 
     def __init__(self, timeout_s: float = 120):
         super().__init__("Search", timeout_s)
-        self.goal = [0, 0]          # 0=未找到, 1=已找到
-        self._rect_waypoints = []   # 矩形航线航点列表（enter 中从 config 计算）
+        self.goal = [0, 0]              # 0=未找到, 1=已找到并投放
+        self._rect_waypoints = []
         self._wp_index = 0
-        self._original_vel_max = None  # 原始 MPC_XY_VEL_MAX，退出时恢复
+        self._original_vel_max = None
 
-        # 视觉流水线: YOLO → Canny边缘 → HoughCircles → 直径
+        # 调度状态
+        self._next_action = None        # None | "fine_align" | "drop" | "navigate"
+        self._active_bottle = 0         # 当前正在处理的瓶子编号 (1 or 2)
+        self._recon_triggered = False
+
+        # 视觉流水线
         self.pipeline = VisionPipeline(
             model_path="models/yolov11n_800_best_FP16.engine",
             yolo_conf=0.5,
@@ -109,8 +105,10 @@ class SearchState(BaseState):
     async def enter(self, interface: "PX4Interface"):
         await super().enter(interface)
 
-        # ---- 从 config 计算矩形航线四顶点 ----
-        # 矩形 3m(N) × 6m(E)，与投放区同心
+        # 初始化 shared 中的 goal（DropState 会更新它）
+        interface.shared.setdefault("goal", self.goal)
+
+        # ---- 矩形航线四顶点 ----
         cn = SEARCH_RECT_CENTER_N_M
         ce = SEARCH_RECT_CENTER_E_M
         hn = SEARCH_RECT_HALF_N_M
@@ -123,7 +121,7 @@ class SearchState(BaseState):
         ]
         self._wp_index = 0
 
-        # ---- 启动 PX4 原生位置飞行（设置限速 + 发送第一个航点 setpoint） ----
+        # ---- 启动 PX4 原生位置飞行 ----
         north_m, east_m = self._rect_waypoints[0]
         target = interface.field_to_ned(north_m, east_m, CRUISE_ALTITUDE_M)
         self._original_vel_max = await interface.start_position_flight(
@@ -133,45 +131,82 @@ class SearchState(BaseState):
               f"高度 {CRUISE_ALTITUDE_M:.1f}m，速度 {SEARCH_SPEED_MPS:.1f} m/s",
               flush=True)
 
+    async def suspend(self, interface: "PX4Interface"):
+        """保存当前 true-NED 位置供投放后返航使用。"""
+        pos = await interface.get_position_ned()
+        interface.shared["position_left"] = PositionNedYaw(
+            pos.north_m, pos.east_m, pos.down_m, interface.FIELD_YAW_DEG,
+        )
+        print(f"[搜索] 中断点已保存: "
+              f"N({pos.north_m:.1f}) E({pos.east_m:.1f})")
+
     async def execute(self, interface: "PX4Interface"):
+        # ---- 同步 goal（DropState 更新后会反映在这里） ----
+        shared_goal = interface.shared.get("goal")
+        if shared_goal is not None:
+            self.goal = shared_goal
+
+        # ---- 侦察已完成，任务结束 ----
+        if self._recon_triggered and self.goal == [1, 1]:
+            self.is_completed = True
+            return ExecutionResult(done=True)
+
+        # ---- 两轮投放完成 → 切入侦察 ----
+        if self.goal == [1, 1] and not self._recon_triggered:
+            self._recon_triggered = True
+            print("[搜索] 两个目标均已投放，触发侦察")
+            return ExecutionResult(interrupt=ReconState(timeout_s=120))
+
+        # ---- 子阶段调度 ----
+        if self._next_action == "fine_align":
+            self._next_action = "drop"
+            return ExecutionResult(interrupt=AlignPreciseState(
+                bottle_index=self._active_bottle))
+        elif self._next_action == "drop":
+            self._next_action = "navigate"
+            return ExecutionResult(interrupt=DropState(
+                bottle_index=self._active_bottle))
+        elif self._next_action == "navigate":
+            self._next_action = None
+            return ExecutionResult(interrupt=PostDropNavState())
+
         # ---- 超时 ----
         if self.is_timed_out():
             self.error = "搜索超时"
             return ExecutionResult(done=True)
 
         # ---- 飞到当前航点 ----
-        # _fly_to_target 会刷新心跳 setpoint 缓存，
-        # PX4 Position Controller 以 200Hz+ 自主飞行。
         arrived = await self._fly_to_target(interface, self._wp_index)
 
-        # ---- 执行视觉检测 ----
+        # ---- 视觉检测 ----
         alt = await interface.get_altitude()
         frame = await capture_frame_async()
-
-        # VisionPipeline: YOLO → Canny边缘 → HoughCircles → 针孔模型算直径
         results = self.pipeline.process_frame(frame, alt_rel_m=alt)
 
         for r in results:
             if not r["edge_success"]:
-                continue                # 圆检测失败，跳过
+                continue
 
-            diameter_cm = r["diameter_m"] * 100   # 真实直径 (cm)
+            diameter_cm = r["diameter_m"] * 100
             # 匹配 15cm 瓶 (goal[0])
             if abs(diameter_cm - 15) <= EPSILON_DIAMETER_CM and self.goal[0] == 0:
                 self.goal[0] = 1
                 self._save_detection(interface, bottle=1, result=r, alt_m=alt)
-                # 栈式抢占：挂起搜索 → 压入对准 → 对准完成后 resume 继续搜索
+                self._next_action = "fine_align"
+                self._active_bottle = 1
                 return ExecutionResult(interrupt=AlignState(bottle_index=1))
             # 匹配 20cm 瓶 (goal[1])
             elif abs(diameter_cm - 20) <= EPSILON_DIAMETER_CM and self.goal[1] == 0:
                 self.goal[1] = 1
                 self._save_detection(interface, bottle=2, result=r, alt_m=alt)
+                self._next_action = "fine_align"
+                self._active_bottle = 2
                 return ExecutionResult(interrupt=AlignState(bottle_index=2))
 
         if not arrived:
-            return ExecutionResult()     # 还在路上，下一帧继续飞 + 检测
+            return ExecutionResult()
 
-        # ---- 到达当前航点 → 推进到下一个，绕圈循环 ----
+        # ---- 推进航点 ----
         self._wp_index = (self._wp_index + 1) % len(self._rect_waypoints)
         north_m, east_m = self._rect_waypoints[self._wp_index]
         target = interface.field_to_ned(north_m, east_m, CRUISE_ALTITUDE_M)
@@ -179,32 +214,17 @@ class SearchState(BaseState):
         return ExecutionResult()
 
     async def exit(self, interface: "PX4Interface"):
-        """退出时恢复原始 MPC_XY_VEL_MAX。"""
         await interface.restore_cruise_speed(self._original_vel_max)
         await super().exit(interface)
 
     # ------------------------------------------------------------------
-    # 航点飞行（PX4 原生位置控制，心跳维持 setpoint）
+    # 航点飞行
     # ------------------------------------------------------------------
 
     async def _fly_to_target(self, interface: "PX4Interface",
                               wp_idx: int) -> bool:
-        """
-        刷新心跳 setpoint 并检查是否到达航点 wp_idx。
-
-        每周期调用 update_setpoint（同步变量赋值，零开销），
-        心跳以 20Hz 将缓存 setpoint 发送给 PX4。
-        PX4 Position Controller 内部以 200Hz+ 处理全程飞行。
-
-        不做直接 set_position_ned 调用 —— 所有 setpoint 统一经心跳发送，
-        避免双路径交替引发的模式切换/振荡问题。
-
-        返回 True 表示已到达（距离 < ARRIVAL_THRESHOLD_M）。
-        """
         north_m, east_m = self._rect_waypoints[wp_idx]
         target = interface.field_to_ned(north_m, east_m, CRUISE_ALTITUDE_M)
-
-        # 刷新心跳缓存 —— 确保 resume 后心跳也发送正确目标
         interface.update_setpoint(target)
 
         pos = await interface.get_position_ned()
@@ -219,17 +239,6 @@ class SearchState(BaseState):
 
     def _save_detection(self, interface: "PX4Interface", bottle: int,
                          result: dict, alt_m: float):
-        """
-        将检测结果写入 interface.shared，供 AlignState.enter() 读取。
-
-        VisionPipeline 结果 → 像素转 NED → CylinderTarget →
-        shared["drop_targets"][bottle-1]
-
-        AlignState 期望:
-            shared["drop_targets"] = [target1_or_None, target2_or_None]
-            target.ned_offset[0]  → 场地北偏移 (米)
-            target.ned_offset[1]  → 场地东偏移 (米)
-        """
         circle = result["circle"]
         ned = pixel_to_ned_offset(circle.cx_px, circle.cy_px, alt_m)
         target = CylinderTarget(

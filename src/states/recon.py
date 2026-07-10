@@ -8,7 +8,10 @@
 航点坐标使用场地 NED 坐标系（north=场地前方, east=场地右方, up=高度）。
 """
 
-from .base_state import BaseState
+import math
+import time
+
+from .base_state import BaseState, ExecutionResult
 
 # 侦察区场地坐标参数
 RECON_FORWARD_M = 59.0       # 侦察区中心前向距离 (m)
@@ -126,7 +129,7 @@ class ReconState(BaseState):
                 print(f"[侦察] transit 超时 (距离 {h_dist:.1f}m), 强制开始扫描")
                 self._phase = "scan"
                 self._seg_start = self.elapsed()
-            return False, None
+            return ExecutionResult()
 
         # ================================================================
         # 阶段 2: 航点扫描
@@ -155,7 +158,7 @@ class ReconState(BaseState):
                     print("[侦察] 扫描完成, 稳定 1s...")
                     self._phase = "stabilize"
                     self._phase_start = self.elapsed()
-            return False, None
+            return ExecutionResult()
 
         # ================================================================
         # 阶段 3: 扫描后悬停稳定, 等待衔接 land
@@ -164,7 +167,7 @@ class ReconState(BaseState):
             if self.elapsed() - self._phase_start > RECON_POST_HOVER:
                 print("[侦察] 稳定完成, 结束")
                 self.is_completed = True
-                return True, None
-            return False, None
+                return ExecutionResult(done=True)
+            return ExecutionResult()
 
         return ExecutionResult()

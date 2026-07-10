@@ -13,9 +13,9 @@ from interface import PX4Interface
 from config import CRUISE_ALTITUDE_M, FSM_LOOP_HZ, MAX_STACK_DEPTH
 from logger_manager import get_logger
 from states.base_state import BaseState
-from states.hover import HoverState
 from states.transit import TransitState
-from states.land_in_place import LandInPlaceState
+from states.search import SearchState
+from states.land import PrecisionLandState
 
 
 class MissionFSM:
@@ -42,8 +42,9 @@ class MissionFSM:
             Hover（栈顶，最先执行）
         """
         self._stack = [
-            LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
-            TransitState(north=500.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),
+            PrecisionLandState(timeout_s=60),                                    # 栈底 — 最后
+            SearchState(timeout_s=120),                                          # 搜索+调度
+            TransitState(north=30.0, east=0.0, up=5.0, speed=5.0, timeout_s=30), # 栈顶 — 飞往投放区
             ]
 
     # ------------------------------------------------------------------
@@ -81,7 +82,8 @@ class MissionFSM:
                 get_logger().log_state_transition(prev_name, state.name)
 
                 # 进入前全局健康检查
-                if not await self.interface.global_guard_check():
+                if not await self.interface.global_guard_check(
+                        allow_disarmed=state.allow_disarmed):
                     await self._handle_unhealthy(
                         f"进入 {state.name} 前全局守卫失败")
                     return
@@ -89,7 +91,8 @@ class MissionFSM:
                 await state.enter(self.interface)
 
             # ---- 每周期全局健康检查 ----
-            if not await self.interface.global_guard_check():
+            if not await self.interface.global_guard_check(
+                    allow_disarmed=state.allow_disarmed):
                 await self._handle_unhealthy(
                     f"{state.name} 执行中健康检查失败")
                 return
