@@ -22,6 +22,7 @@ import math
 from mavsdk.offboard import PositionNedYaw, VelocityNedYaw
 
 from .base_state import BaseState, ExecutionResult
+from .align import AlignState
 from config import (
     DROP_ALIGN_ALTITUDE_M,
     ALIGN_THRESHOLD_M,
@@ -425,9 +426,11 @@ class RollTaskState(BaseState):
         alt = await interface.get_altitude()
 
         if alt <= DROP_ALIGN_ALTITUDE_M:
-            self.phase = "drop"
-            print(f"[下降] 到达投放高度: {alt:.2f}m")
-            return ExecutionResult()
+            self.phase = "return_home"   # 预置：等 AlignState 完成后 resume 自动衔接
+            self._drop_done = True       # 交给 AlignState，exit() 不重置 goal
+            bottle = 1 if self.target_type == "15" else 2
+            print(f"[下降] 到达投放高度: {alt:.2f}m，切换 AlignState(bottle={bottle})")
+            return ExecutionResult(interrupt=AlignState(bottle_index=bottle))
 
         if self.elapsed() - self._descend_start_time > 15.0:
             self.error = "下降超时"
