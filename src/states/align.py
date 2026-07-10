@@ -118,27 +118,13 @@ class AlignState(BaseState):
             e = (best["cx_px"] - cx) * z_c / fx
             n = -(best["cy_px"] - cy) * z_c / fy
 
-            self._target = {"ned_offset": (n, e), "diameter_m": best["diameter_m"]}
+            self._target = {"ned_offset": (n, e)}
             print(f"[粗对准] 目标 NED 偏移: N({n:.3f}) E({e:.3f}) 米")
 
         except Exception as e:
             self.error = f"视觉检测失败: {e}"
             print(f"[粗对准] 错误: {self.error}")
             return
-
-        # ---- 桥接到 shared，供 AlignPreciseState 读取 ----
-        from .search import CylinderTarget
-        bridge_target = CylinderTarget(
-            ned_offset=(n, e),
-            diameter_m=best["diameter_m"],
-            conf=0.0,
-            circle_cx_px=best["cx_px"],
-            circle_cy_px=best["cy_px"],
-        )
-        if "drop_targets" not in interface.shared:
-            interface.shared["drop_targets"] = [None, None]
-        interface.shared["drop_targets"][self.bottle_index - 1] = bridge_target
-        print(f"[粗对准] 目标已桥接到 shared['drop_targets'][{self.bottle_index - 1}]")
 
         # 初始位置 setpoint
         n, e = self._target["ned_offset"]
