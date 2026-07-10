@@ -26,7 +26,7 @@ from config import (
     DROP_ALIGN_ALTITUDE_M,
     DROP_ZONE_DISTANCE_M,
 )
-from pid_controller import PIDController
+from pid_velocity import VelocityPID
 from vision.camera import capture_frame_async
 from vision.circle_detector import DEFAULT_CAMERA_MATRIX
 from vision.pipeline import VisionPipeline
@@ -90,8 +90,11 @@ class AlignPreciseState(BaseState):
         self._last_detect_time = 0.0
         self._pid_engaged = False     # True = 已切入 PID 精调模式
 
-        # PID 控制器 (像素差 → 速度指令)
-        self._pid = PIDController(kp=2.0, ki=0.0, kd=0.0, max_vel=MAX_VEL)
+        # PID 控制器 (NED 偏移 m → 速度 m/s, 两轴独立)
+        self._pid_north = VelocityPID(
+            kp=0.6, ki=0.15, kd=0.2, max_out=self.MAX_VEL)
+        self._pid_east = VelocityPID(
+            kp=0.6, ki=0.15, kd=0.2, max_out=self.MAX_VEL)
 
         # 视觉流水线（实时 YOLO 检测）
         self._pipeline = VisionPipeline(
@@ -177,7 +180,8 @@ class AlignPreciseState(BaseState):
         now = time.monotonic()
 
         # ---- 节流 ----
-        if now - self._last_detect_time < self.CYCLE_INTERVAL:
+        dt_since_last = now - self._last_detect_time
+        if dt_since_last < self.CYCLE_INTERVAL:
             return ExecutionResult()
         self._last_detect_time = now
 
@@ -248,22 +252,24 @@ class AlignPreciseState(BaseState):
                   f"耗时:{elapsed:.1f}s")
             interface.shared[f"bottle_{self.bottle_index}_position"] = best
             interface.clear_velocity()
-            self._pid.reset()
+            self._pid_north.reset()
+            self._pid_east.reset()
             self._pid_engaged = False
             self.is_completed = True
             return ExecutionResult(done=True)
 
         # ---- 4. 速度控制: 近距离 PID / 远距离 P ----
         if distance <= self.PID_ENGAGE_DISTANCE_M:
-            # -------- PID 精调 (像素差 → 速度) --------
+            # -------- PID 精调 (NED 偏移 m → 速度 m/s) --------
             if not self._pid_engaged:
-                self._pid.reset()
+                self._pid_north.reset()
+                self._pid_east.reset()
                 self._pid_engaged = True
                 print(f"[精细对准] 距离 {distance:.2f}m ≤ "
                       f"{self.PID_ENGAGE_DISTANCE_M}m，切入 PID 精调")
 
-            dt = now - self._last_detect_time
-            v_north, v_east = self._pid.update(dx_px, dy_px, dt)
+            v_north = self._pid_north.update(dx, now)
+            v_east = self._pid_east.update(dy, now)
         else:
             # -------- P 控制逼近 (NED 偏移 → 速度) --------
             if self._pid_engaged:

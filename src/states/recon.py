@@ -12,6 +12,7 @@ import math
 import time
 
 from .base_state import BaseState, ExecutionResult
+from config import ARRIVAL_THRESHOLD_M
 
 # 侦察区场地坐标参数
 RECON_FORWARD_M = 59.0       # 侦察区中心前向距离 (m)
@@ -136,27 +137,46 @@ class ReconState(BaseState):
         # 阶段 2: 航点扫描
         # ================================================================
         if self._phase == "scan":
-            _, _, wp_z = self._waypoints[self._current_wp]  # 只用于高度判据
+            nx, ny, nz = self._waypoints[self._current_wp]
             alt = await interface.get_altitude()
+
+            # 计算水平距离
+            target = interface.field_to_ned(nx, ny, nz)
+            pos = await interface.get_position_ned()
+            h_dist = math.hypot(target.north_m - pos.north_m,
+                                target.east_m  - pos.east_m)
 
             seg_dist = self._seg_distance(self._current_wp)
             est_time = seg_dist / RECON_SPEED_MPS if seg_dist > 0 else 0.5
+            phase_elapsed = self.elapsed() - self._seg_start
 
-            # 到达判据: 本段预计时间已过 且 高度接近目标
-            if (self.elapsed() - self._seg_start > est_time
-                    and abs(alt - wp_z) < 0.5):
+            # 到达判据: 位置为主 (h_dist < 0.5m), 时间兜底 (odometry 漂移)
+            if h_dist < ARRIVAL_THRESHOLD_M and abs(alt - nz) < 0.5:
                 self._current_wp += 1
 
                 if self._current_wp < len(self._waypoints):
-                    # 推进到下一航点
-                    nx, ny, nz = self._waypoints[self._current_wp]
-                    sp = interface.field_to_ned(nx, ny, nz)
+                    nx2, ny2, nz2 = self._waypoints[self._current_wp]
+                    sp = interface.field_to_ned(nx2, ny2, nz2)
                     interface.update_setpoint(sp)
                     self._seg_start = self.elapsed()
                     print(f"[侦察] 航点 {self._current_wp}/{len(self._waypoints)}")
                 else:
-                    # 所有航点走完, 进入稳定阶段
                     print("[侦察] 扫描完成, 稳定 1s...")
+                    self._phase = "stabilize"
+                    self._phase_start = self.elapsed()
+            elif phase_elapsed > est_time * 1.5:
+                # 超时兜底: 1.5 倍预计时间后即使位置略差也强行推进
+                print(f"[侦察] scan 超时 (距离 {h_dist:.1f}m), 强制推进航点")
+                self._current_wp += 1
+
+                if self._current_wp < len(self._waypoints):
+                    nx2, ny2, nz2 = self._waypoints[self._current_wp]
+                    sp = interface.field_to_ned(nx2, ny2, nz2)
+                    interface.update_setpoint(sp)
+                    self._seg_start = self.elapsed()
+                    print(f"[侦察] 航点 {self._current_wp}/{len(self._waypoints)}")
+                else:
+                    print("[侦察] 扫描完成 (强制), 稳定 1s...")
                     self._phase = "stabilize"
                     self._phase_start = self.elapsed()
             return ExecutionResult()
