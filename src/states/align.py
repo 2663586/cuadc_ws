@@ -1,164 +1,296 @@
 """
-对准状态 —— 下降并通过视觉伺服居中到目标圆柱体上方。
+粗对准状态 —— 位置控制飞去目标 + 速度P伺服微调 + 编排下游链。
 
-从 interface.shared 读取目标（由 SearchState 填充）。
-两个子阶段：下降至约 3 米，然后视觉伺服 P 控制对准。
+由 SearchState 在 investigate 验证通过后 push 进来。
 
-ned_offset 使用场地 NED 坐标系（与 field_to_ned 的输入坐标系一致）。
+内部阶段:
+  transit          → 位置控制飞向目标（视觉跟踪持续更新）
+  servo            → 速度 P 控制精调
+  [下游链]         → descend → fine_align → drop
+  done             → SearchState resume
+
+参数:
+  bottle_index: 1 或 2，由 SearchState 传入
 """
 
-import asyncio
+import math
+
+from mavsdk.offboard import PositionNedYaw, VelocityNedYaw
 
 from .base_state import BaseState, ExecutionResult
+from .align_precise import AlignPreciseState
+from .drop import DropState
 from config import (
-    DROP_ALIGN_ALTITUDE_M, DROP_ZONE_DISTANCE_M,
-    ALIGN_THRESHOLD_M, SEARCH_TIMEOUT_S, VISUAL_SERVO_KP,
+    DROP_ALIGN_ALTITUDE_M,
+    ALIGN_THRESHOLD_M,
+    ARRIVAL_THRESHOLD_M,
+    BUCKET_HEIGHT_M,
+    VISUAL_SERVO_KP,
 )
+from vision.camera import capture_frame_async
+from vision.yolo_detector import YOLODetector
+from vision.circle_detector import CircleDetector
 
 
 class AlignState(BaseState):
-    """通过视觉伺服在目标圆柱体上方进行精细对准。"""
+    """粗对准 + 编排 descend→fine_align→drop 链。"""
 
-    def __init__(self, bottle_index: int, timeout_s: float = 60):
+    def __init__(self, bottle_index: int, timeout_s: float = 90):
         super().__init__("Align", timeout_s)
         self.bottle_index = bottle_index
 
-        # 子阶段
-        self.phase = "descend"  # descend → servo → done
-        self._search_start = 0.0
+        # ---- 内部阶段 ----
+        self._phase: str = "transit"  # transit → servo → [chain]
+
+        # ---- 下游链 ----
+        self._chain_step: str = ""    # "descend" → "fine_align" → "drop" → "done"
+
+        # ---- 目标追踪 ----
         self._target = None
+        self._enter_position = None
+        self._enter_alt: float = 0.0
+
+        # ---- 视觉 ----
+        self.yolo_detector = YOLODetector()
+        self.circle_detector = CircleDetector()
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
 
     async def enter(self, interface):
         await super().enter(interface)
 
-        targets = interface.shared.get("drop_targets")
-        if targets is None:
-            self.error = "共享缓存中没有粗略检测结果"
-            print(f"[对准] {self.error}")
+        # 记录进入位置
+        pos = await interface.get_position_ned()
+        self._enter_position = pos
+        self._enter_alt = await interface.get_altitude()
+
+        # 自行检测目标（search 不填 drop_targets 内容）
+        try:
+            frame = await capture_frame_async()
+            alt = await interface.get_altitude()
+
+            yolo_dets = self.yolo_detector.detect(frame)
+            bucket_dets = [d for d in yolo_dets
+                           if d["cls"] == 1 and d["conf"] >= 0.3]
+
+            if not bucket_dets:
+                self.error = "视野中无桶目标"
+                print("[粗对准] 错误: 无桶目标")
+                return
+
+            # 对每个桶做圆检测
+            candidates = []
+            for det in bucket_dets:
+                bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
+                cr = self.circle_detector.detect(frame, bbox)
+                if cr is not None:
+                    d_m = self.circle_detector.compute_diameter(
+                        cr.radius_px, alt)
+                    if d_m > 0:
+                        candidates.append({
+                            "cx_px": cr.cx_px, "cy_px": cr.cy_px,
+                            "diameter_m": d_m,
+                        })
+
+            if not candidates:
+                self.error = "未检测到有效圆"
+                print("[粗对准] 错误: 无有效圆")
+                return
+
+            # 选匹配 15cm/20cm 的最近目标
+            best = None
+            for c in candidates:
+                d_cm = c["diameter_m"] * 100
+                if abs(d_cm - 15) < 2 or abs(d_cm - 20) < 2:
+                    best = c; break
+
+            if best is None:
+                self.error = "未检测到 15cm/20cm 目标"
+                print(f"[粗对准] 错误: {self.error}")
+                return
+
+            # NED 偏移
+            fx = self.circle_detector.fx; fy = self.circle_detector.fy
+            cx = self.circle_detector.cx; cy = self.circle_detector.cy
+            z_c = alt - BUCKET_HEIGHT_M
+            e = (best["cx_px"] - cx) * z_c / fx
+            n = -(best["cy_px"] - cy) * z_c / fy
+
+            self._target = {"ned_offset": (n, e)}
+            print(f"[粗对准] 目标 NED 偏移: N({n:.3f}) E({e:.3f}) 米")
+
+        except Exception as e:
+            self.error = f"视觉检测失败: {e}"
+            print(f"[粗对准] 错误: {self.error}")
             return
 
-        idx = 0 if self.bottle_index == 1 else 1
-        self._target = targets[idx]
-
-        if self._target is None:
-            self.error = f"瓶子 {self.bottle_index} 没有分配目标"
-            print(f"[对准] {self.error}")
-            return
-
-        # 向目标圆柱体下降
-        sp = interface.field_to_ned(
-            DROP_ZONE_DISTANCE_M + self._target.ned_offset[0],
-            self._target.ned_offset[1],
-            DROP_ALIGN_ALTITUDE_M,
-        )
+        # 初始位置 setpoint
+        n, e = self._target["ned_offset"]
+        dn, de = self._rotate_offset(n, e, interface.FIELD_YAW_DEG)
+        sp = PositionNedYaw(
+            self._enter_position.north_m + dn,
+            self._enter_position.east_m + de,
+            -self._enter_alt, interface.FIELD_YAW_DEG)
         interface.update_setpoint(sp)
-        self.phase = "descend"
-        self._search_start = self.elapsed()
-        print(f"[对准] 瓶子 {self.bottle_index}: 正在下降到 "
-              f"目标上方 {DROP_ALIGN_ALTITUDE_M:.1f} 米")
+
+        self._phase = "transit"
+        print("[粗对准] 进入 transit (位置控制)")
 
     async def execute(self, interface):
+        if self.error:
+            print(f"[粗对准] 错误退出: {self.error}")
+            return ExecutionResult(done=True)
+
         if self.is_timed_out():
-            self.error = "对准超时"
+            self.error = "粗对准超时"
+            print("[粗对准] 超时退出")
             return ExecutionResult(done=True)
 
-        if self._target is None:
-            return ExecutionResult(done=True)  # enter() 已设置错误
+        # ---- 下游链编排 ----
+        if self._chain_step == "descend":
+            self._chain_step = "fine_align"
+            print(f"[粗对准] 调度: 下降至 {DROP_ALIGN_ALTITUDE_M}m")
+            return ExecutionResult(interrupt=DescendState(self.bottle_index))
 
-        if self.phase == "descend":
-            return await self._do_descend(interface)
-        elif self.phase == "servo":
-            return await self._do_visual_servo(interface)
-        return ExecutionResult()
+        elif self._chain_step == "fine_align":
+            self._chain_step = "drop"
+            print(f"[粗对准] 调度: 精细对准 (瓶子 {self.bottle_index})")
+            return ExecutionResult(interrupt=AlignPreciseState(
+                bottle_index=self.bottle_index, skip_descend=True))
 
-    async def _do_descend(self, interface):
-        """等待高度降到约 3 米。"""
-        alt = await interface.get_altitude()
-        if alt <= 3.0:
-            self.phase = "servo"
-            self._search_start = self.elapsed()
-            print(f"[对准] 瓶子 {self.bottle_index}: 开始视觉伺服")
-        return ExecutionResult()
+        elif self._chain_step == "drop":
+            self._chain_step = "done"
+            print(f"[粗对准] 调度: 投放 (瓶子 {self.bottle_index})")
+            return ExecutionResult(interrupt=DropState(
+                bottle_index=self.bottle_index))
 
-    async def _do_visual_servo(self, interface):
-        """视觉伺服循环 —— 检测圆柱体，计算偏移，P 控制。"""
-        from config import YOLO_CONFIDENCE_THRESHOLD
-
-        alt = await interface.get_altitude()
-
-        try:
-            from vision.yolo_detector import get_detector
-            detector = get_detector()
-            frame = await _capture_frame_async()
-            cylinders = detector.detect_cylinders(frame, alt)
-        except Exception as e:
-            print(f"[对准] 检测错误: {e}")
-            return ExecutionResult()
-
-        best = self._match_target(cylinders)
-
-        if best is None:
-            # 目标丢失 —— 搜索超时
-            if self.elapsed() - self._search_start > SEARCH_TIMEOUT_S:
-                print(f"[警告] 对准 瓶子 {self.bottle_index}: "
-                      f"目标丢失超时，放弃")
-                return ExecutionResult(done=True)
-
-            # 保持位置，向最后已知位置漂移
-            sp = interface.field_to_ned(
-                DROP_ZONE_DISTANCE_M + self._target.ned_offset[0],
-                self._target.ned_offset[1],
-                alt,
-            )
-            interface.update_setpoint(sp)
-            return ExecutionResult()
-
-        self._search_start = self.elapsed()  # 重置搜索计时器
-        offset_x, offset_y = best.ned_offset
-        self._target = best  # 用更精确的低空估计更新
-
-        # 检查对准
-        if (abs(offset_x) < ALIGN_THRESHOLD_M
-                and abs(offset_y) < ALIGN_THRESHOLD_M):
-            interface.shared[f"bottle_{self.bottle_index}_aligned"] = True
-            interface.shared[f"bottle_{self.bottle_index}_position"] = best
+        elif self._chain_step == "done":
+            print("[粗对准] 链完成 → 退出")
             self.is_completed = True
-            print(f"[对准] 瓶子 {self.bottle_index}: 已对准")
             return ExecutionResult(done=True)
 
-        # P 控制位置调整
-        sp = interface.field_to_ned(
-            DROP_ZONE_DISTANCE_M + offset_x * VISUAL_SERVO_KP,
-            offset_y * VISUAL_SERVO_KP,
-            alt,
-        )
+        # ---- 视觉跟踪（transit + servo 共用） ----
+        try:
+            frame = await capture_frame_async()
+            alt = await interface.get_altitude()
+
+            yolo_dets = self.yolo_detector.detect(frame)
+            bucket_dets = [d for d in yolo_dets
+                           if d["cls"] == 1 and d["conf"] >= 0.3]
+
+            if bucket_dets:
+                fx = self.circle_detector.fx; fy = self.circle_detector.fy
+                cx = self.circle_detector.cx; cy = self.circle_detector.cy
+                t_n, t_e = self._target["ned_offset"]
+
+                best_match, best_dist = None, float('inf')
+                for det in bucket_dets:
+                    bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
+                    cr = self.circle_detector.detect(frame, bbox)
+                    if cr is not None:
+                        z_c = alt - BUCKET_HEIGHT_M
+                        e = (cr.cx_px - cx) * z_c / fx
+                        n = -(cr.cy_px - cy) * z_c / fy
+                        d = (n - t_n)**2 + (e - t_e)**2
+                        if d < best_dist:
+                            best_dist = d
+                            best_match = {"ned_offset": (n, e)}
+
+                if best_match and best_dist < 1.0:
+                    self._target["ned_offset"] = best_match["ned_offset"]
+
+        except Exception as e:
+            print(f"[粗对准] 视觉异常: {e}")
+
+        # ---- 阶段分发 ----
+        if self._phase == "transit":
+            return await self._do_transit(interface)
+        elif self._phase == "servo":
+            return await self._do_servo(interface)
+
+        return ExecutionResult()
+
+    async def _do_transit(self, interface):
+        if self._target is None:
+            return ExecutionResult()
+
+        n, e = self._target["ned_offset"]
+        if abs(n) < ARRIVAL_THRESHOLD_M and abs(e) < ARRIVAL_THRESHOLD_M:
+            self._phase = "servo"
+            print(f"[粗对准] 到达目标附近 → 速度P伺服")
+            return ExecutionResult()
+
+        dn, de = self._rotate_offset(n, e, interface.FIELD_YAW_DEG)
+        sp = PositionNedYaw(
+            self._enter_position.north_m + dn,
+            self._enter_position.east_m + de,
+            -self._enter_alt, interface.FIELD_YAW_DEG)
         interface.update_setpoint(sp)
         return ExecutionResult()
 
-    def _match_target(self, cylinders: list):
-        """通过最近 NED 偏移匹配检测到的圆柱体与目标。"""
-        if not cylinders:
-            return None
-        tx, ty = self._target.ned_offset
-        best = min(cylinders,
-                   key=lambda c: (c.ned_offset[0] - tx) ** 2
-                                 + (c.ned_offset[1] - ty) ** 2)
-        return best
+    async def _do_servo(self, interface):
+        if self._target is None:
+            return ExecutionResult()
+
+        n, e = self._target["ned_offset"]
+        if abs(n) < ALIGN_THRESHOLD_M and abs(e) < ALIGN_THRESHOLD_M:
+            interface.clear_velocity()
+            self._chain_step = "descend"
+            self._phase = ""
+            print("[粗对准] 对准成功 → 启动下游链")
+            return ExecutionResult()
+
+        vn = VISUAL_SERVO_KP * n
+        ve = VISUAL_SERVO_KP * e
+        vn, ve = self._rotate_offset(vn, ve, interface.FIELD_YAW_DEG)
+        vel = VelocityNedYaw(vn, ve, 0.0, interface.FIELD_YAW_DEG)
+        interface.update_velocity_setpoint(vel)
+        return ExecutionResult()
+
+    async def exit(self, interface):
+        interface.clear_velocity()
+        await super().exit(interface)
+
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rotate_offset(n, e, yaw_deg):
+        theta = math.radians(yaw_deg)
+        dn = n * math.cos(theta) - e * math.sin(theta)
+        de = n * math.sin(theta) + e * math.cos(theta)
+        return dn, de
 
 
-async def _capture_frame_async():
-    """从相机捕获单帧图像（在线程池中运行）。"""
-    import asyncio
-    import concurrent.futures
+class DescendState(BaseState):
+    """下降到投放高度。"""
 
-    from vision.yolo_detector import _camera
+    def __init__(self, bottle_index: int, timeout_s: float = 30):
+        super().__init__("Descend", timeout_s)
+        self.bottle_index = bottle_index
 
-    if _camera is None:
-        raise RuntimeError("相机未初始化")
+    async def execute(self, interface):
+        alt = await interface.get_altitude()
+        if alt <= DROP_ALIGN_ALTITUDE_M:
+            print(f"[下降] 到达投放高度: {alt:.2f}m")
+            self.is_completed = True
+            return ExecutionResult(done=True)
 
-    loop = asyncio.get_running_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    ret, frame = await loop.run_in_executor(executor, _camera.read)
-    if not ret:
-        raise RuntimeError("捕获帧失败")
-    return frame
+        if self.is_timed_out():
+            self.error = "下降超时"
+            return ExecutionResult(done=True)
+
+        # 保持当前水平位置，只降高度
+        pos = await interface.get_position_ned()
+        sp = PositionNedYaw(
+            pos.north_m, pos.east_m,
+            -DROP_ALIGN_ALTITUDE_M, interface.FIELD_YAW_DEG)
+        interface.update_setpoint(sp)
+        return ExecutionResult()
+
+    async def exit(self, interface):
+        interface.clear_velocity()
+        await super().exit(interface)

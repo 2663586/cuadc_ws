@@ -43,7 +43,7 @@ class MissionFSM:
         from states.search import SearchState
 
         self._stack = [
-            LandInPlaceState(timeout_s=60),                                # 栈底 — 最后
+            PrecisionLandState(timeout_s=60),                                # 栈底 — 最后 (RTL)
             SearchState(timeout_s=120),                                     # 巡逻搜索
             TransitState(north=30.0, east=0.0, up=5.0, speed=5.0, timeout_s=30),  # 飞往投放区
             ]
