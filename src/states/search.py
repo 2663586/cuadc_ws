@@ -1,5 +1,5 @@
 """
-搜索状态 —— 矩形航线巡逻 + VisionPipeline 检测 + 目标匹配。
+搜索状态 —— 矩形航线巡逻 + VisionPipeline 检测。
 
 飞行模式：
   沿矩形航线四顶点循环飞行，每帧执行
@@ -31,6 +31,8 @@ import math
 from dataclasses import dataclass
 from typing import Tuple, TYPE_CHECKING
 
+from mavsdk.offboard import PositionNedYaw
+
 from .base_state import BaseState, ExecutionResult
 from .recon import ReconState
 from .roll_task import RollTaskState
@@ -46,7 +48,7 @@ from vision.pipeline import VisionPipeline
 if TYPE_CHECKING:
     from interface import PX4Interface
 
-# 相机内参 — 从 CircleDetector 提取，避免硬编码不同步
+# 相机内参
 _FX = float(DEFAULT_CAMERA_MATRIX[0, 0])
 _FY = float(DEFAULT_CAMERA_MATRIX[1, 1])
 _CX = float(DEFAULT_CAMERA_MATRIX[0, 2])
@@ -68,10 +70,10 @@ def pixel_to_ned_offset(cx_px: float, cy_px: float, alt_rel_m: float,
     z_c = alt_rel_m - bucket_h
     if z_c <= 0:
         return (0.0, 0.0)
-    dx = cx_px - cx          # 右 = 东
-    dy = cy_px - cy          # 下 = 南
+    dx = cx_px - cx
+    dy = cy_px - cy
     east_m = dx * z_c / fx
-    north_m = -dy * z_c / fy  # 下 = 南 = -北
+    north_m = -dy * z_c / fy
     return (north_m, east_m)
 
 
@@ -96,6 +98,7 @@ class SearchState(BaseState):
         self._rect_waypoints = []   # 矩形航线航点列表（enter 中从 config 计算）
         self._wp_index = 0
         self._original_vel_max = None  # 原始 MPC_XY_VEL_MAX，退出时恢复
+        self._recon_triggered = False  # 防止重复触发侦察
 
         # 视觉流水线: YOLO → Canny边缘 → HoughCircles → 直径
         self.pipeline = VisionPipeline(
@@ -129,7 +132,7 @@ class SearchState(BaseState):
         ]
         self._wp_index = 0
 
-        # ---- 启动 PX4 原生位置飞行（设置限速 + 发送第一个航点 setpoint） ----
+        # ---- 启动 PX4 原生位置飞行 ----
         north_m, east_m = self._rect_waypoints[0]
         target = interface.field_to_ned(north_m, east_m, CRUISE_ALTITUDE_M)
         self._original_vel_max = await interface.start_position_flight(
@@ -138,6 +141,15 @@ class SearchState(BaseState):
         print(f"[搜索] 矩形航线开始，{len(self._rect_waypoints)} 个航点，"
               f"高度 {CRUISE_ALTITUDE_M:.1f}m，速度 {SEARCH_SPEED_MPS:.1f} m/s",
               flush=True)
+
+    async def suspend(self, interface: "PX4Interface"):
+        """保存当前 true-NED 位置供投放后返航使用。"""
+        pos = await interface.get_position_ned()
+        interface.shared["position_left"] = PositionNedYaw(
+            pos.north_m, pos.east_m, pos.down_m, interface.FIELD_YAW_DEG,
+        )
+        print(f"[搜索] 中断点已保存: "
+              f"N({pos.north_m:.1f}) E({pos.east_m:.1f})")
 
     async def execute(self, interface: "PX4Interface"):
         # ---- ReconState 完成后 resume，直接退出 ----
@@ -156,20 +168,16 @@ class SearchState(BaseState):
             return ExecutionResult(done=True)
 
         # ---- 飞到当前航点 ----
-        # _fly_to_target 会刷新心跳 setpoint 缓存，
-        # PX4 Position Controller 以 200Hz+ 自主飞行。
         arrived = await self._fly_to_target(interface, self._wp_index)
 
-        # ---- 执行视觉检测 ----
+        # ---- 视觉检测 ----
         alt = await interface.get_altitude()
         frame = await capture_frame_async()
-
-        # VisionPipeline: YOLO → Canny边缘 → HoughCircles → 针孔模型算直径
         results = self.pipeline.process_frame(frame, alt_rel_m=alt)
 
         for r in results:
             if not r["edge_success"]:
-                continue                # 圆检测失败，跳过
+                continue
 
             diameter_cm = r["diameter_m"] * 100   # 真实直径 (cm)
 
@@ -198,32 +206,17 @@ class SearchState(BaseState):
         return ExecutionResult()
 
     async def exit(self, interface: "PX4Interface"):
-        """退出时恢复原始 MPC_XY_VEL_MAX。"""
         await interface.restore_cruise_speed(self._original_vel_max)
         await super().exit(interface)
 
     # ------------------------------------------------------------------
-    # 航点飞行（PX4 原生位置控制，心跳维持 setpoint）
+    # 航点飞行
     # ------------------------------------------------------------------
 
     async def _fly_to_target(self, interface: "PX4Interface",
                               wp_idx: int) -> bool:
-        """
-        刷新心跳 setpoint 并检查是否到达航点 wp_idx。
-
-        每周期调用 update_setpoint（同步变量赋值，零开销），
-        心跳以 20Hz 将缓存 setpoint 发送给 PX4。
-        PX4 Position Controller 内部以 200Hz+ 处理全程飞行。
-
-        不做直接 set_position_ned 调用 —— 所有 setpoint 统一经心跳发送，
-        避免双路径交替引发的模式切换/振荡问题。
-
-        返回 True 表示已到达（距离 < ARRIVAL_THRESHOLD_M）。
-        """
         north_m, east_m = self._rect_waypoints[wp_idx]
         target = interface.field_to_ned(north_m, east_m, CRUISE_ALTITUDE_M)
-
-        # 刷新心跳缓存 —— 确保 resume 后心跳也发送正确目标
         interface.update_setpoint(target)
 
         pos = await interface.get_position_ned()

@@ -13,9 +13,9 @@ from interface import PX4Interface
 from config import CRUISE_ALTITUDE_M, FSM_LOOP_HZ, MAX_STACK_DEPTH
 from logger_manager import get_logger
 from states.base_state import BaseState
-from states.hover import HoverState
 from states.transit import TransitState
-from states.land_in_place import LandInPlaceState
+from states.search import SearchState
+from states.land import PrecisionLandState
 
 
 class MissionFSM:
@@ -83,7 +83,8 @@ class MissionFSM:
                 get_logger().log_state_transition(prev_name, state.name)
 
                 # 进入前全局健康检查
-                if not await self.interface.global_guard_check():
+                if not await self.interface.global_guard_check(
+                        allow_disarmed=state.allow_disarmed):
                     await self._handle_unhealthy(
                         f"进入 {state.name} 前全局守卫失败")
                     return
@@ -91,7 +92,8 @@ class MissionFSM:
                 await state.enter(self.interface)
 
             # ---- 每周期全局健康检查 ----
-            if not await self.interface.global_guard_check():
+            if not await self.interface.global_guard_check(
+                    allow_disarmed=state.allow_disarmed):
                 await self._handle_unhealthy(
                     f"{state.name} 执行中健康检查失败")
                 return
