@@ -59,6 +59,7 @@ class DropState(BaseState):
         # ---- 判定去向 ----
         self.is_completed = True
         if goal == [1, 1]:
+            interface.shared["goto_recon"] = True
             print("[投放] 两轮投放均完成 → 前往侦察区")
             return ExecutionResult(interrupt=PostDropNavState(
                 destination="recon"))
