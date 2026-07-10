@@ -20,16 +20,17 @@ goal 三态:
 
 import math
 
-from mavsdk.offboard import VelocityNedYaw
+from mavsdk.offboard import PositionNedYaw, VelocityNedYaw
 
 from .base_state import BaseState, ExecutionResult
-from .hover import HoverState
 from .align_precise import AlignPreciseState
 from .drop import DropState
 from .post_drop_nav import PostDropNavState
 from config import (
     DROP_ALIGN_ALTITUDE_M,
+    ALIGN_THRESHOLD_M,
     ARRIVAL_THRESHOLD_M,
+    BUCKET_HEIGHT_M,
     SEARCH_TIMEOUT_S,
     VISUAL_SERVO_KP,
 )
@@ -40,9 +41,6 @@ from vision.circle_detector import CircleDetector
 
 class RollTaskState(BaseState):
     """粗对准 + 下降 + HSK 组件编排。"""
-
-    # 粗对准参数
-    COARSE_ALIGN_THRESHOLD_M = 0.1  # 粗对准完成判据 (NED偏移, 米)
 
     def __init__(self, timeout_s: float = 90):
         super().__init__("ROLL_TASK", timeout_s)
@@ -65,6 +63,7 @@ class RollTaskState(BaseState):
         self._enter_alt: float = 0.0
 
         # ---- 任务状态标志 ----
+        self._drop_done: bool = False
         self._descend_start_time: float = 0.0
 
         # ---- 视觉检测器 ----
@@ -166,15 +165,15 @@ class RollTaskState(BaseState):
         print(f"[ROLL_TASK] 选择 {self.target_type}cm 目标 "
               f"(直径 {target_match['diameter_m']*100:.1f}cm)")
 
-        # ---- 步骤 5: 像素坐标 → NED 偏移 (与 pixel_to_ned_offset 一致) ----
+        # ---- 步骤 5: 像素坐标 → NED 偏移 ----
         fx = self.circle_detector.fx
         fy = self.circle_detector.fy
         cx = self.circle_detector.cx
         cy = self.circle_detector.cy
 
-        # 图像右=场地东, 图像下=场地南=-北
-        offset_east  = (self._target["cx_px"] - cx) * alt / fx
-        offset_north = -(self._target["cy_px"] - cy) * alt / fy
+        z_c = alt - BUCKET_HEIGHT_M
+        offset_east  = (self._target["cx_px"] - cx) * z_c / fx
+        offset_north = -(self._target["cy_px"] - cy) * z_c / fy
 
         self._target["ned_offset"] = (offset_north, offset_east)
         print(f"[ROLL_TASK] 目标 NED 偏移: "
@@ -194,11 +193,14 @@ class RollTaskState(BaseState):
         interface.shared["drop_targets"][self._active_bottle - 1] = bridge_target
         print(f"[ROLL_TASK] 目标已桥接到 shared['drop_targets'][{self._active_bottle - 1}]")
 
-        # ---- 步骤 7: 设定初始位置 setpoint ----
-        sp = interface.field_to_ned(
-            self._enter_position.north_m + offset_north,
-            self._enter_position.east_m + offset_east,
-            self._enter_alt,
+        # ---- 步骤 7: 设定初始位置 setpoint (offset 旋转到真北 NED) ----
+        dn, de = self._rotate_offset(
+            offset_north, offset_east, interface.FIELD_YAW_DEG)
+        sp = PositionNedYaw(
+            self._enter_position.north_m + dn,
+            self._enter_position.east_m + de,
+            -self._enter_alt,
+            interface.FIELD_YAW_DEG,
         )
         interface.update_setpoint(sp)
 
@@ -273,11 +275,27 @@ class RollTaskState(BaseState):
         return ExecutionResult()
 
     # ------------------------------------------------------------------
+    # 退出清理
+    # ------------------------------------------------------------------
+
+    async def exit(self, interface):
+        """退出时清理：清速度、未投成则重置所有 goal=0 的项为 None。"""
+        interface.clear_velocity()
+        if not self._drop_done:
+            goal = interface.shared.get("goal")
+            if goal is not None:
+                for i in (0, 1):
+                    if goal[i] == 0:
+                        goal[i] = None
+                        print(f"[ROLL_TASK] 未投成，重置 goal[{i}]=None，允许重试")
+        await super().exit(interface)
+
+    # ------------------------------------------------------------------
     # 视觉丢失检测
     # ------------------------------------------------------------------
 
     async def _check_visual_loss(self, interface):
-        """检查目标是否丢失。丢失超时 → interrupt=HoverState()。"""
+        """检查目标是否丢失。丢失超时 → done=True 退回 SearchState。"""
         if self._target is None:
             return None
 
@@ -292,8 +310,9 @@ class RollTaskState(BaseState):
             if not bucket_dets:
                 if self.elapsed() - self._search_start > SEARCH_TIMEOUT_S:
                     self.error = "视觉丢失超时 (无目标)"
-                    print("[视觉丢失] 无目标且超时，切换 HOVER")
-                    return ExecutionResult(interrupt=HoverState())
+                    print("[视觉丢失] 无目标且超时，退回 SearchState")
+                    interface.clear_velocity()
+                    return ExecutionResult(done=True)
                 return None
 
             fx = self.circle_detector.fx
@@ -309,8 +328,9 @@ class RollTaskState(BaseState):
                 bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
                 circle_result = self.circle_detector.detect(frame, bbox)
                 if circle_result is not None:
-                    e  = (circle_result.cx_px - cx) * alt / fx
-                    n  = -(circle_result.cy_px - cy) * alt / fy
+                    z_c = alt - BUCKET_HEIGHT_M
+                    e  = (circle_result.cx_px - cx) * z_c / fx
+                    n  = -(circle_result.cy_px - cy) * z_c / fy
                     dn = n - t_north
                     de = e - t_east
                     dist = dn * dn + de * de
@@ -331,8 +351,9 @@ class RollTaskState(BaseState):
 
             if self.elapsed() - self._search_start > SEARCH_TIMEOUT_S:
                 self.error = "视觉丢失超时 (匹配失败)"
-                print("[视觉丢失] 匹配失败且超时，切换 HOVER")
-                return ExecutionResult(interrupt=HoverState())
+                print("[视觉丢失] 匹配失败且超时，退回 SearchState")
+                interface.clear_velocity()
+                return ExecutionResult(done=True)
             return None
 
         except Exception as e:
@@ -374,8 +395,9 @@ class RollTaskState(BaseState):
                     bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
                     circle_result = self.circle_detector.detect(frame, bbox)
                     if circle_result is not None:
-                        e  = (circle_result.cx_px - cx) * alt / fx
-                        n  = -(circle_result.cy_px - cy) * alt / fy
+                        z_c = alt - BUCKET_HEIGHT_M
+                        e  = (circle_result.cx_px - cx) * z_c / fx
+                        n  = -(circle_result.cy_px - cy) * z_c / fy
                         dn = n - t_north
                         de = e - t_east
                         dist = dn * dn + de * de
@@ -405,11 +427,14 @@ class RollTaskState(BaseState):
                   f"(N={offset_north:.2f} E={offset_east:.2f})，切换速度 P 控制")
             return ExecutionResult()
 
-        # ---- 更新位置 setpoint: 持续飞向目标 ----
-        sp = interface.field_to_ned(
-            self._enter_position.north_m + offset_north,
-            self._enter_position.east_m + offset_east,
-            self._enter_alt,
+        # ---- 更新位置 setpoint: 持续飞向目标 (offset 旋转到真北 NED) ----
+        dn, de = self._rotate_offset(
+            offset_north, offset_east, interface.FIELD_YAW_DEG)
+        sp = PositionNedYaw(
+            self._enter_position.north_m + dn,
+            self._enter_position.east_m + de,
+            -self._enter_alt,
+            interface.FIELD_YAW_DEG,
         )
         interface.update_setpoint(sp)
 
@@ -446,8 +471,9 @@ class RollTaskState(BaseState):
                     bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
                     circle_result = self.circle_detector.detect(frame, bbox)
                     if circle_result is not None:
-                        e  = (circle_result.cx_px - cx) * alt / fx
-                        n  = -(circle_result.cy_px - cy) * alt / fy
+                        z_c = alt - BUCKET_HEIGHT_M
+                        e  = (circle_result.cx_px - cx) * z_c / fx
+                        n  = -(circle_result.cy_px - cy) * z_c / fy
                         dn = n - t_north
                         de = e - t_east
                         dist = dn * dn + de * de
@@ -471,7 +497,8 @@ class RollTaskState(BaseState):
 
         # ---- 检查对准精度 ----
         offset_north, offset_east = self._target["ned_offset"]
-        if abs(offset_north) < self.COARSE_ALIGN_THRESHOLD_M and abs(offset_east) < self.COARSE_ALIGN_THRESHOLD_M:
+        if (abs(offset_north) < ALIGN_THRESHOLD_M
+                and abs(offset_east) < ALIGN_THRESHOLD_M):
             # ★ 切回位置模式，让 descend 阶段用位置控制下降
             interface.clear_velocity()
             self.phase = "descend"
@@ -497,6 +524,7 @@ class RollTaskState(BaseState):
 
         if alt <= DROP_ALIGN_ALTITUDE_M:
             print(f"[下降] 到达投放高度: {alt:.2f}m → 交接给 HSK 精细对准")
+            self._drop_done = True     # 交给 HSK 链，exit() 不重置 goal
             self._hsk_step = "fine_align"
             self.phase = ""  # 退出内部阶段，进入 HSK 调度
             return ExecutionResult()
@@ -508,11 +536,27 @@ class RollTaskState(BaseState):
 
         if self._target is not None:
             offset_north, offset_east = self._target["ned_offset"]
-            sp = interface.field_to_ned(
-                self._enter_position.north_m + offset_north,
-                self._enter_position.east_m + offset_east,
-                DROP_ALIGN_ALTITUDE_M,
+            dn, de = self._rotate_offset(
+                offset_north, offset_east, interface.FIELD_YAW_DEG)
+            sp = PositionNedYaw(
+                self._enter_position.north_m + dn,
+                self._enter_position.east_m + de,
+                -DROP_ALIGN_ALTITUDE_M,
+                interface.FIELD_YAW_DEG,
             )
             interface.update_setpoint(sp)
 
         return ExecutionResult()
+
+    # ------------------------------------------------------------------
+    # 工具：场地偏移 → 真北 NED 旋转
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rotate_offset(offset_north: float, offset_east: float,
+                        yaw_deg: float):
+        """场地坐标系的偏移 → 真北 NED 偏移"""
+        theta = math.radians(yaw_deg)
+        dn = offset_north * math.cos(theta) - offset_east * math.sin(theta)
+        de = offset_north * math.sin(theta) + offset_east * math.cos(theta)
+        return dn, de

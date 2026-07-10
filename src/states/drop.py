@@ -25,7 +25,10 @@ class DropState(BaseState):
         print(f"[投放] 瓶子 {self.bottle_index}: 已释放")
 
         # ---- 根据检测到的直径更新 goal 跟踪 ----
-        goal = interface.shared.setdefault("goal", [0, 0])
+        goal = interface.shared.get("goal")
+        if goal is None:
+            goal = [0, 0]
+            interface.shared["goal"] = goal
         bottle_key = f"bottle_{self.bottle_index}_position"
         if bottle_key in interface.shared:
             detected = interface.shared[bottle_key]
