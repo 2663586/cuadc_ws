@@ -97,17 +97,22 @@ class PostDropNavState(BaseState):
             target_ned = interface.field_to_ned(
                 RECON_FORWARD_M, -RECON_RIGHT_HALF, CRUISE_ALTITUDE_M)
         else:
-            # 中断点
-            pos_left = interface.shared.get("position_left")
-            if pos_left is None:
-                print("[导航] Step 1 跳过 (无中断点)")
-                self._step = 2
-                self._step_init = True
-                return ExecutionResult()
-            target_ned = PositionNedYaw(
-                pos_left.north_m, pos_left.east_m,
-                -CRUISE_ALTITUDE_M, interface.FIELD_YAW_DEG,
-            )
+            # 中断点: 优先读 return_pos (新 search), 回退 position_left
+            return_pos = interface.shared.get("return_pos")
+            if return_pos is not None and return_pos != (-1234.0, -1234.0):
+                target_ned = interface.field_to_ned(
+                    return_pos[0], return_pos[1], CRUISE_ALTITUDE_M)
+            else:
+                pos_left = interface.shared.get("position_left")
+                if pos_left is None:
+                    print("[导航] Step 1 跳过 (无中断点)")
+                    self._step = 2
+                    self._step_init = True
+                    return ExecutionResult()
+                target_ned = PositionNedYaw(
+                    pos_left.north_m, pos_left.east_m,
+                    -CRUISE_ALTITUDE_M, interface.FIELD_YAW_DEG,
+                )
 
         # ---- 首次进入: 发布飞行指令 ----
         if self._step_init:
