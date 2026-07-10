@@ -4,6 +4,7 @@ from .hover import HoverState
 from .transit import TransitState
 from .search import SearchState
 from .align import AlignState
+from .roll_task import RollTaskState
 from .align_precise import AlignPreciseState
 from .drop import DropState
 from .post_drop_nav import PostDropNavState
