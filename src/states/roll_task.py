@@ -33,8 +33,7 @@ from config import (
     USE_SERVO,
 )
 from vision.camera import capture_frame_async
-from vision.yolo_detector import YOLODetector
-from vision.circle_detector import CircleDetector
+from vision.pipeline import VisionPipeline
 
 
 class RollTaskState(BaseState):
@@ -66,14 +65,18 @@ class RollTaskState(BaseState):
         self._drop_done: bool = False
         self._descend_start_time: float = 0.0
         self._align_start_time: float = 0.0
+        self._retrying: bool = False      # 视觉丢失后回 POSITION_LEFT 重试
 
         # ---- PID 控制器 (可选，各通道独立) ----
         self._pid_n = pid_n   # north 通道
         self._pid_e = pid_e   # east 通道
 
-        # ---- 视觉检测器 ----
-        self.yolo_detector = YOLODetector()
-        self.circle_detector = CircleDetector()
+        # ---- 视觉流水线: YOLO → Canny边缘 → HoughCircles → 直径 ----
+        self.pipeline = VisionPipeline(
+            model_path="models/yolov11n_800_best_FP16.engine",
+            yolo_conf=0.5,
+            circle_conf_threshold=0.3,
+        )
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -109,34 +112,22 @@ class RollTaskState(BaseState):
                 print(f"[ROLL_TASK] 错误: 无可投放目标, goal={goal}")
                 return
 
-        # ---- 步骤 3: 自行检测目标 (YOLO + CircleDetector) ----
+        # ---- 步骤 3: 自行检测目标 (VisionPipeline: YOLO→Canny→HoughCircles) ----
         try:
             frame = await capture_frame_async()
             alt = await interface.get_altitude()
 
-            yolo_dets = self.yolo_detector.detect(frame)
-            bucket_dets = [d for d in yolo_dets
-                           if d["cls"] == 1 and d["conf"] >= 0.3]
-
-            if not bucket_dets:
-                self.error = "视野中无任何桶目标"
-                print("[ROLL_TASK] 错误: 无桶目标")
-                return
-
-            detected_targets = []
-            for det in bucket_dets:
-                bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
-                circle_result = self.circle_detector.detect(frame, bbox)
-                if circle_result is not None:
-                    diameter_m = self.circle_detector.compute_diameter(
-                        circle_result.radius_px, alt)
-                    if diameter_m > 0:
-                        detected_targets.append({
-                            "bbox": bbox,
-                            "cx_px": circle_result.cx_px,
-                            "cy_px": circle_result.cy_px,
-                            "diameter_m": diameter_m,
-                        })
+            results = self.pipeline.process_frame(frame, alt_rel_m=alt)
+            detected_targets = [
+                {
+                    "bbox": (r["det"]["x1"], r["det"]["y1"],
+                             r["det"]["x2"], r["det"]["y2"]),
+                    "cx_px": r["circle"].cx_px,
+                    "cy_px": r["circle"].cy_px,
+                    "diameter_m": r["diameter_m"],
+                }
+                for r in results if r["edge_success"]
+            ]
 
             if not detected_targets:
                 self.error = "未检测到有效圆 (边缘检测失败)"
@@ -169,10 +160,10 @@ class RollTaskState(BaseState):
               f"(直径 {target_match['diameter_m']*100:.1f}cm)")
 
         # ---- 步骤 5: 像素坐标 → NED 偏移 (与 pixel_to_ned_offset 一致) ----
-        fx = self.circle_detector.fx
-        fy = self.circle_detector.fy
-        cx = self.circle_detector.cx
-        cy = self.circle_detector.cy
+        fx = self.pipeline.circle.fx
+        fy = self.pipeline.circle.fy
+        cx = self.pipeline.circle.cx
+        cy = self.pipeline.circle.cy
 
         # 图像右=场地东, 图像下=场地南=-北
         z_c = alt - BUCKET_HEIGHT_M
@@ -251,7 +242,7 @@ class RollTaskState(BaseState):
     # ------------------------------------------------------------------
 
     async def _check_visual_loss(self, interface):
-        """检查目标是否丢失。丢失超时 → done=True 退回 SearchState。"""
+        """检查目标是否丢失。丢失超时 → 退回 POSITION_LEFT 重试。"""
         if self._target is None:
             return None
 
@@ -259,62 +250,65 @@ class RollTaskState(BaseState):
             frame = await capture_frame_async()
             alt = await interface.get_altitude()
 
-            yolo_dets = self.yolo_detector.detect(frame)
-            bucket_dets = [d for d in yolo_dets
-                           if d["cls"] == 1 and d["conf"] >= 0.3]
-
-            if not bucket_dets:
+            match = self._match_target(interface, frame, alt)
+            if match is None:
                 if self.elapsed() - self._search_start > SEARCH_TIMEOUT_S:
-                    self.error = "视觉丢失超时 (无目标)"
-                    print("[视觉丢失] 无目标且超时，退回 SearchState")
+                    self.error = "视觉丢失超时，退回 POSITION_LEFT 重试"
+                    print("[视觉丢失] 目标丢失且超时，退回 POSITION_LEFT 重试")
                     interface.clear_velocity()
-                    return ExecutionResult(done=True)
+                    self.phase = "return_home"
+                    self._retrying = True
+                    return None
                 return None
 
-            fx = self.circle_detector.fx
-            fy = self.circle_detector.fy
-            cx = self.circle_detector.cx
-            cy = self.circle_detector.cy
-            t_north, t_east = self._target["ned_offset"]
-
-            best_match = None
-            best_distance = float('inf')
-
-            for det in bucket_dets:
-                bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
-                circle_result = self.circle_detector.detect(frame, bbox)
-                if circle_result is not None:
-                    z_c = alt - BUCKET_HEIGHT_M
-                    e  = (circle_result.cx_px - cx) * z_c / fx
-                    n  = -(circle_result.cy_px - cy) * z_c / fy
-                    dn = n - t_north
-                    de = e - t_east
-                    dist = dn * dn + de * de
-                    if dist < best_distance:
-                        best_distance = dist
-                        best_match = {
-                            "ned_offset": (n, e),
-                            "cx_px": circle_result.cx_px,
-                            "cy_px": circle_result.cy_px,
-                        }
-
-            if best_match and best_distance < 1.0:
-                self._target["ned_offset"] = best_match["ned_offset"]
-                self._target["cx_px"] = best_match["cx_px"]
-                self._target["cy_px"] = best_match["cy_px"]
-                self._search_start = self.elapsed()
-                return None
-
-            if self.elapsed() - self._search_start > SEARCH_TIMEOUT_S:
-                self.error = "视觉丢失超时 (匹配失败)"
-                print("[视觉丢失] 匹配失败且超时，退回 SearchState")
-                interface.clear_velocity()
-                return ExecutionResult(done=True)
+            self._target.update(match)
+            self._search_start = self.elapsed()
             return None
 
         except Exception as e:
             print(f"[视觉丢失] 检测异常: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # 视觉匹配辅助
+    # ------------------------------------------------------------------
+
+    def _match_target(self, interface, frame, alt):
+        """
+        VisionPipeline 检测 + 目标匹配。匹配成功返回
+        {"ned_offset": (n,e), "cx_px": int, "cy_px": int}，失败返回 None。
+        """
+        results = self.pipeline.process_frame(frame, alt_rel_m=alt)
+        valid = [r for r in results if r["edge_success"]]
+        if not valid:
+            return None
+
+        fx = self.pipeline.circle.fx
+        fy = self.pipeline.circle.fy
+        cx = self.pipeline.circle.cx
+        cy = self.pipeline.circle.cy
+        t_north, t_east = self._target["ned_offset"]
+
+        best_match = None
+        best_distance = float('inf')
+
+        for r in valid:
+            circle = r["circle"]
+            z_c = alt - BUCKET_HEIGHT_M
+            e = (circle.cx_px - cx) * z_c / fx
+            n = -(circle.cy_px - cy) * z_c / fy
+            dn = n - t_north
+            de = e - t_east
+            dist = dn * dn + de * de
+            if dist < best_distance:
+                best_distance = dist
+                best_match = {
+                    "ned_offset": (n, e),
+                    "cx_px": circle.cx_px,
+                    "cy_px": circle.cy_px,
+                }
+
+        return best_match if (best_match and best_distance < 1.0) else None
 
     # ------------------------------------------------------------------
     # 粗到位阶段 (位置控制 → PX4 原生飞往目标)
@@ -335,43 +329,10 @@ class RollTaskState(BaseState):
             frame = await capture_frame_async()
             alt = await interface.get_altitude()
 
-            yolo_dets = self.yolo_detector.detect(frame)
-            bucket_dets = [d for d in yolo_dets
-                           if d["cls"] == 1 and d["conf"] >= 0.3]
-
-            if bucket_dets:
-                fx = self.circle_detector.fx
-                fy = self.circle_detector.fy
-                cx = self.circle_detector.cx
-                cy = self.circle_detector.cy
-                t_north, t_east = self._target["ned_offset"]
-
-                best_match = None
-                best_distance = float('inf')
-
-                for det in bucket_dets:
-                    bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
-                    circle_result = self.circle_detector.detect(frame, bbox)
-                    if circle_result is not None:
-                        z_c = alt - BUCKET_HEIGHT_M
-                        e  = (circle_result.cx_px - cx) * z_c / fx
-                        n  = -(circle_result.cy_px - cy) * z_c / fy
-                        dn = n - t_north
-                        de = e - t_east
-                        dist = dn * dn + de * de
-                        if dist < best_distance:
-                            best_distance = dist
-                            best_match = {
-                                "ned_offset": (n, e),
-                                "cx_px": circle_result.cx_px,
-                                "cy_px": circle_result.cy_px,
-                            }
-
-                if best_match and best_distance < 1.0:
-                    self._target["ned_offset"] = best_match["ned_offset"]
-                    self._target["cx_px"] = best_match["cx_px"]
-                    self._target["cy_px"] = best_match["cy_px"]
-                    self._search_start = self.elapsed()
+            match = self._match_target(interface, frame, alt)
+            if match is not None:
+                self._target.update(match)
+                self._search_start = self.elapsed()
 
         except Exception as e:
             print(f"[粗到位] 视觉检测异常: {e}")
@@ -419,43 +380,10 @@ class RollTaskState(BaseState):
             frame = await capture_frame_async()
             alt = await interface.get_altitude()
 
-            yolo_dets = self.yolo_detector.detect(frame)
-            bucket_dets = [d for d in yolo_dets
-                           if d["cls"] == 1 and d["conf"] >= 0.3]
-
-            if bucket_dets:
-                fx = self.circle_detector.fx
-                fy = self.circle_detector.fy
-                cx = self.circle_detector.cx
-                cy = self.circle_detector.cy
-                t_north, t_east = self._target["ned_offset"]
-
-                best_match = None
-                best_distance = float('inf')
-
-                for det in bucket_dets:
-                    bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
-                    circle_result = self.circle_detector.detect(frame, bbox)
-                    if circle_result is not None:
-                        z_c = alt - BUCKET_HEIGHT_M
-                        e  = (circle_result.cx_px - cx) * z_c / fx
-                        n  = -(circle_result.cy_px - cy) * z_c / fy
-                        dn = n - t_north
-                        de = e - t_east
-                        dist = dn * dn + de * de
-                        if dist < best_distance:
-                            best_distance = dist
-                            best_match = {
-                                "ned_offset": (n, e),
-                                "cx_px": circle_result.cx_px,
-                                "cy_px": circle_result.cy_px,
-                            }
-
-                if best_match and best_distance < 1.0:
-                    self._target["ned_offset"] = best_match["ned_offset"]
-                    self._target["cx_px"] = best_match["cx_px"]
-                    self._target["cy_px"] = best_match["cy_px"]
-                    self._search_start = self.elapsed()
+            match = self._match_target(interface, frame, alt)
+            if match is not None:
+                self._target.update(match)
+                self._search_start = self.elapsed()
 
         except Exception as e:
             print(f"[对准] 视觉检测异常: {e}")
@@ -513,43 +441,10 @@ class RollTaskState(BaseState):
         try:
             frame = await capture_frame_async()
 
-            yolo_dets = self.yolo_detector.detect(frame)
-            bucket_dets = [d for d in yolo_dets
-                           if d["cls"] == 1 and d["conf"] >= 0.3]
-
-            if bucket_dets:
-                fx = self.circle_detector.fx
-                fy = self.circle_detector.fy
-                cx = self.circle_detector.cx
-                cy = self.circle_detector.cy
-                t_north, t_east = self._target["ned_offset"]
-
-                best_match = None
-                best_distance = float('inf')
-
-                for det in bucket_dets:
-                    bbox = (det["x1"], det["y1"], det["x2"], det["y2"])
-                    circle_result = self.circle_detector.detect(frame, bbox)
-                    if circle_result is not None:
-                        z_c = alt - BUCKET_HEIGHT_M
-                        e  = (circle_result.cx_px - cx) * z_c / fx
-                        n  = -(circle_result.cy_px - cy) * z_c / fy
-                        dn = n - t_north
-                        de = e - t_east
-                        dist = dn * dn + de * de
-                        if dist < best_distance:
-                            best_distance = dist
-                            best_match = {
-                                "ned_offset": (n, e),
-                                "cx_px": circle_result.cx_px,
-                                "cy_px": circle_result.cy_px,
-                            }
-
-                if best_match and best_distance < 1.0:
-                    self._target["ned_offset"] = best_match["ned_offset"]
-                    self._target["cx_px"] = best_match["cx_px"]
-                    self._target["cy_px"] = best_match["cy_px"]
-                    self._search_start = self.elapsed()
+            match = self._match_target(interface, frame, alt)
+            if match is not None:
+                self._target.update(match)
+                self._search_start = self.elapsed()
 
         except Exception as e:
             print(f"[下降] 视觉检测异常: {e}")
@@ -619,8 +514,55 @@ class RollTaskState(BaseState):
         distance = math.sqrt(dx ** 2 + dy ** 2)
 
         if distance < 0.3:
+            if self._retrying:
+                # 视觉丢失重试：回到起点，重新检测目标
+                self._retrying = False
+                self._search_start = self.elapsed()
+                print("[返回] 已回到 POSITION_LEFT，重新检测目标...")
+                try:
+                    frame = await capture_frame_async()
+                    alt = await interface.get_altitude()
+                    # 重新检测匹配 self.target_type 的目标
+                    results = self.pipeline.process_frame(frame, alt_rel_m=alt)
+                    valid = [r for r in results if r["edge_success"]]
+                    target_match = None
+                    for r in valid:
+                        d = r["diameter_m"] * 100
+                        if self.target_type == "15" and abs(d - 15) < 2:
+                            target_match = r; break
+                        elif self.target_type == "20" and abs(d - 20) < 2:
+                            target_match = r; break
+                    if target_match is None:
+                        self.error = "重试失败：未检测到目标"
+                        print("[返回] 重试失败，退出")
+                        return ExecutionResult(done=True)
+                    self._target = {
+                        "cx_px": target_match["circle"].cx_px,
+                        "cy_px": target_match["circle"].cy_px,
+                        "diameter_m": target_match["diameter_m"],
+                        "ned_offset": (0.0, 0.0),
+                    }
+                    fx = self.pipeline.circle.fx; fy = self.pipeline.circle.fy
+                    cx = self.pipeline.circle.cx; cy = self.pipeline.circle.cy
+                    z_c = alt - BUCKET_HEIGHT_M
+                    e = (self._target["cx_px"] - cx) * z_c / fx
+                    n = -(self._target["cy_px"] - cy) * z_c / fy
+                    self._target["ned_offset"] = (n, e)
+                    self.phase = "transit"
+                    print("[返回] 重试：重新进入粗到位阶段")
+                    return ExecutionResult()
+                except Exception as e:
+                    self.error = f"重试视觉检测失败: {e}"
+                    print(f"[返回] {self.error}")
+                    return ExecutionResult(done=True)
+
             self.is_completed = True
-            print("[返回] 已回到 POSITION_LEFT，弹出自身 → SearchState resume")
+            goal = interface.shared.get("goal")
+            if goal == [1, 1]:
+                interface.shared["goto_recon"] = True
+                print("[返回] 已回到 POSITION_LEFT，全部投完，通知 SearchState 切 ReconState")
+            else:
+                print("[返回] 已回到 POSITION_LEFT，弹出自身 → SearchState resume")
             return ExecutionResult(done=True)
 
         sp = PositionNedYaw(

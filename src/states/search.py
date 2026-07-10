@@ -144,10 +144,10 @@ class SearchState(BaseState):
         if self.is_completed:
             return ExecutionResult(done=True)
 
-        # ---- 全部投放完毕？切换侦查状态 ----
-        if interface.shared["goal"] == [1, 1]:
+        # ---- RollTask 通知：全部投完 → 切侦查状态 ----
+        if interface.shared.pop("goto_recon", False):
             self.is_completed = True
-            print("[搜索] 所有目标已投放完毕，切换 ReconState")
+            print("[搜索] RollTask 通知全部投完，切换 ReconState")
             return ExecutionResult(interrupt=ReconState())
 
         # ---- 超时 ----
